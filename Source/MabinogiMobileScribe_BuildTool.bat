@@ -6,14 +6,19 @@ REM ============================================================
 setlocal
 cd /d %~dp0
 
-REM ---- Auto-detect: pick the most recently modified MabinogiMobileScribe_*.py ----
-set SCRIPT=
-for /f "delims=" %%f in ('dir /b /o-d "MabinogiMobileScribe_*.py" 2^>nul') do (
-    if not defined SCRIPT set SCRIPT=%%f
+REM ---- Locate source: filename no longer carries a version, so name it directly ----
+REM      Fall back to the old "newest MabinogiMobileScribe_*.py" scan so a working
+REM      copy that still holds an old versioned filename keeps building.
+set "SCRIPT="
+if exist "MabinogiMobileScribe_Beta.py" set "SCRIPT=MabinogiMobileScribe_Beta.py"
+if not defined SCRIPT (
+    for /f "delims=" %%f in ('dir /b /o-d "MabinogiMobileScribe_*.py" 2^>nul') do (
+        if not defined SCRIPT set SCRIPT=%%f
+    )
 )
 
 if not defined SCRIPT (
-    echo [ERROR] Cannot find any MabinogiMobileScribe_*.py in current directory.
+    echo [ERROR] Cannot find MabinogiMobileScribe_Beta.py in current directory.
     pause
     exit /b 1
 )

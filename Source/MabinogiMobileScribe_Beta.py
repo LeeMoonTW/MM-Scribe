@@ -8,15 +8,15 @@ macOS 上遊戲為 iOS App on Mac,流量直接走實體網卡,抓法與 Windows 
 
 打包說明:
   Windows 開發版 (顯示開發者選項):
-    python -m PyInstaller --onefile --noconsole --collect-data customtkinter MabinogiMobileScribe_Beta_V0.52.py
+    python -m PyInstaller --onefile --noconsole --collect-data customtkinter MabinogiMobileScribe_Beta.py
 
   Windows 發布版 (隱藏開發者選項):
     type nul > RELEASE.marker
-    python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." MabinogiMobileScribe_Beta_V0.52.py
+    python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." MabinogiMobileScribe_Beta.py
 
   macOS (--add-data 分隔符是 ':' 不是 ';'):
     touch RELEASE.marker
-    python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta_V0.52.py
+    python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta.py
 
   程式啟動時會偵測執行檔內是否包含 RELEASE.marker 檔案,
   存在則隱藏開發者選項按鈕(釋出給他人使用)。

@@ -4,7 +4,7 @@
 #  Usage: ./MabinogiMobileScribe_BuildTool.sh
 #
 #  對應 Windows 版的 MabinogiMobileScribe_BuildTool.bat,行為刻意保持一致:
-#    - 自動挑最新修改的 MabinogiMobileScribe_*.py,換版本號不用改這支腳本
+#    - 原始碼固定叫 MabinogiMobileScribe_Beta.py,換版本號不用改這支腳本
 #    - 產出 Dev(含開發者選項) 與 Release(隱藏) 兩個版本
 #  macOS 的差異:
 #    - --add-data 分隔符是 ':' 不是 ';'
@@ -19,10 +19,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ---- Auto-detect: pick the most recently modified MabinogiMobileScribe_*.py ----
-SCRIPT="$(ls -t MabinogiMobileScribe_*.py 2>/dev/null | head -1 || true)"
+# ---- Locate source: 檔名不再帶版號,直接指名 ----
+#      找不到才退回舊的「挑最新修改的 MabinogiMobileScribe_*.py」,
+#      讓還留著舊版號檔名的工作目錄不會突然建置失敗。
+SCRIPT="MabinogiMobileScribe_Beta.py"
+if [[ ! -f "$SCRIPT" ]]; then
+    SCRIPT="$(ls -t MabinogiMobileScribe_*.py 2>/dev/null | head -1 || true)"
+fi
 if [[ -z "$SCRIPT" ]]; then
-    echo "[ERROR] Cannot find any MabinogiMobileScribe_*.py in current directory." >&2
+    echo "[ERROR] Cannot find MabinogiMobileScribe_Beta.py in current directory." >&2
     exit 1
 fi
 echo "Detected source: $SCRIPT"

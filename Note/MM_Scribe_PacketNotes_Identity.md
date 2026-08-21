@@ -99,7 +99,7 @@ characterId = accountInfo << 16 | characterIndex
 
 ---
 
-## 4. 程式實作對照（`Source/MabinogiMobileScribe_Beta_V0.52.py`）
+## 4. 程式實作對照（`Source/MabinogiMobileScribe_Beta.py`）
 
 | 函式 | 做什麼 |
 |---|---|

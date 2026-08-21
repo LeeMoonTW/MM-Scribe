@@ -28,7 +28,7 @@ if [[ -d "$BASE/lib/tcl8.6" ]]; then
     export "${TK_ENV[@]}"
 fi
 
-SCRIPT="Source/MabinogiMobileScribe_Beta_V0.52.py"
+SCRIPT="Source/MabinogiMobileScribe_Beta.py"
 
 # 能直接開 BPF 就不必提權(裝過 Wireshark 的 ChmodBPF 就屬於這種情況)
 if "$VENV_PY" - <<'PY' 2>/dev/null

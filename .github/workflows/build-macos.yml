@@ -38,14 +38,31 @@ jobs:
 
       # 用 ditto 而非 zip:.app 是目錄結構,ditto 才會保留 symlink 與
       # 簽章所需的 metadata,否則解壓後的 app 會打不開。
+      # 原始碼檔名不再帶版號(見 RELEASING.md),所以版號改讀 VERSION_STR。
+      # zip 名稱格式維持不變:MMScribe.Beta.V0.52.macOS.zip
       - name: 壓縮 Release 版
         working-directory: Source/dist
         run: |
-          SRC="$(ls -t ../MabinogiMobileScribe_*.py | head -1)"
-          VER="$(basename "$SRC" .py)"
-          VER="${VER#MabinogiMobileScribe_}"
-          VER="${VER//_/.}"
-          NAME="MMScribe.${VER}.macOS.zip"
+          VER="$(sed -n 's/^VERSION_STR[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+                   ../MabinogiMobileScribe_Beta.py | head -1)"
+          if [ -z "$VER" ]; then
+            echo "::error::讀不到 VERSION_STR,無法決定發布檔名"
+            exit 1
+          fi
+
+          # 打 tag 發版時順手核對。VERSION_STR 忘了跟 tag 一起更新的話,
+          # 會做出一個版號對不上 release 的 zip — 不值得中斷建置,但要講出來。
+          case "${GITHUB_REF:-}" in
+            refs/tags/*)
+              tag_num="${GITHUB_REF_NAME#v}"; tag_num="${tag_num%%-*}"
+              ver_num="${VER##*[Vv]}"
+              if [ "$tag_num" != "$ver_num" ]; then
+                echo "::warning::tag 是 ${GITHUB_REF_NAME},但 VERSION_STR 是「${VER}」— 版號不一致"
+              fi
+              ;;
+          esac
+
+          NAME="MMScribe.${VER// /.}.macOS.zip"
           ditto -c -k --keepParent "MM Scribe.app" "$NAME"
           echo "ZIP_NAME=$NAME" >> "$GITHUB_ENV"
           ls -la "$NAME"

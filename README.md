@@ -193,14 +193,14 @@ popout_skill = false           ; 技能傷害排行獨立視窗
 **開發版**（顯示開發者選項）：
 
 ```bash
-python -m PyInstaller --onefile --noconsole --collect-data customtkinter MabinogiMobileScribe_Beta_V0.52.py
+python -m PyInstaller --onefile --noconsole --collect-data customtkinter MabinogiMobileScribe_Beta.py
 ```
 
 **發布版**（隱藏開發者選項）：
 
 ```bash
 type nul > RELEASE.marker
-python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." MabinogiMobileScribe_Beta_V0.52.py
+python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." MabinogiMobileScribe_Beta.py
 ```
 
 ### macOS
@@ -209,7 +209,7 @@ python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-d
 
 ```bash
 touch RELEASE.marker
-python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta_V0.52.py
+python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta.py
 ```
 
 PyInstaller 只會做 ad-hoc 簽章（沒有 Team ID），因此 `.app` 一定會被 Gatekeeper 攔下，
@@ -221,6 +221,20 @@ BPF 權限時，會引導使用者做一次性設定（見使用說明第 2 點�
 必須跟著打包進 bundle，建置腳本已處理。
 
 程式啟動時會偵測 EXE 內是否包含 `RELEASE.marker` 檔案，存在則隱藏開發者選項按鈕（釋出給他人使用）。
+
+---
+
+## 發版
+
+版號寫在 [Source/MabinogiMobileScribe_Beta.py](Source/MabinogiMobileScribe_Beta.py) 的
+`VERSION_STR`，原始碼檔名不帶版號。發版用根目錄的 [release.sh](release.sh)：
+
+```bash
+./release.sh 0.53            # 更新版號 → commit → 打 tag → 推送 → 開 draft release
+./release.sh 0.53 --dry-run  # 先看它打算做什麼
+```
+
+流程細節與檔名調整的原因見 [RELEASING.md](RELEASING.md)。
 
 ---
 
