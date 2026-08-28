@@ -126,7 +126,7 @@ characterId = accountInfo << 16 | characterIndex
 - `characterId` 的位移不是常數，靠搜尋；理論上可能撞到別的欄位剛好等於同一個 u64（實測未發生，且 8 bytes 全等的機率極低）。
 - 需要 `brotli`。**這是硬相依，不是選用的**：0x4FFF / 0x4E4F 都是 `enc=1`（Brotli），
   沒裝就完全無法偵測 —— 而 §9 的門檻會讓傷害統計連帶整個空白。
-  三份安裝清單（`README.md`、`run-macos.sh`、`.github/workflows/build-macos.yml`）
+  安裝清單（`README.md`、`run-macos.sh`、`.github/workflows/build.yaml`）
   都必須列上 `Brotli==1.1.0`；曾經漏過一次，症狀是紅字「尚未偵測到角色ID」，
   而那句話會把人導去換地圖，換幾次都不會好。缺套件時改報 `IDENT_MSG_NO_BROTLI`。
 

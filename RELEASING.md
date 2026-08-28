@@ -59,7 +59,7 @@ VERSION_STR = "Beta V0.52"
 | 誰 | 用途 |
 |---|---|
 | 程式本身 | 視窗標題顯示的版本（`MM Scribe Beta V0.52`） |
-| `.github/workflows/build-macos.yml` | 決定發布 zip 的檔名 |
+| `.github/workflows/build.yaml` | 決定發布 zip / exe zip 的檔名 |
 | `release.sh` | 比對／更新版號，並據此打 tag |
 
 發布檔名的格式沒有變，仍然是 `MMScribe.Beta.V0.52.macOS.zip` —— 只是來源從
@@ -141,12 +141,14 @@ tag 已存在時腳本**不會代為刪除**，只印出手動刪除的指令 �
 
 1. 把要發的內容都合進 `main`，`git push` 完
 2. `./release.sh 0.53`
-3. 到 Actions 看 macOS 建置（約數分鐘），完成後 zip 會自動掛到 draft release
-4. Windows 版 exe 要在 Windows 上跑 `Source/MabinogiMobileScribe_BuildTool.bat`，
-   再手動附到同一個 release
-5. 回到 draft release 寫發版說明，按 Publish
+3. 到 Actions 看 [build.yaml](.github/workflows/build.yaml) 的兩個 job —— macOS 與
+   Windows 並行建置（約數分鐘），完成後 `MMScribe.*.macOS.zip` 與
+   `MMScribe.*.Windows.zip` 都會自動掛到 draft release。
+   Windows zip 內含 Release 版 `MM Scribe.exe` 與預設的 `settings.ini`、`skills.ini`
+4. 回到 draft release 寫發版說明，按 Publish
 
-第 4 步是目前唯一沒自動化的環節 —— CI 只有 macOS runner，Windows 版仍是手動建置。
+兩個平台都已自動化；某個 job 失敗時可在 Actions 頁面單獨重跑該 job，
+不必整條 workflow 重來。
 
 ---
 

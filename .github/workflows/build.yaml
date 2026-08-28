@@ -1,0 +1,178 @@
+name: Build MM Scribe
+
+# 打 v* tag 發版時 macOS 與 Windows 兩個 job 並行建置,並把產物掛上同一個
+# release;平時 push 不會跑。公開 repo 使用 standard runner 免費且不限額度。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    # 《瑪奇 Mobile》在 macOS 上是 iOS App on Mac,只能在 Apple Silicon 執行,
+    # 所以不需要 Intel/ARM 雙架構 matrix。
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 提早失敗:tkinter 缺了的話,等打包完才發現會浪費整輪 build
+      - name: 確認 tkinter 可用
+        run: python -c "import tkinter; print('Tk', tkinter.TkVersion)"
+
+      # Brotli 是角色身分偵測的硬相依 — 少了它解不開 0x4FFF / 0x4E4F,
+      # 綁不到自己的實體 ID,傷害統計會整個空白 (見 PacketNotes_Identity §9)。
+      - name: 安裝相依套件
+        run: python -m pip install scapy==2.7.0 customtkinter==5.2.2 Brotli==1.1.0 pyinstaller==6.21.0
+
+      - name: 建置 .app
+        working-directory: Source
+        run: ./MabinogiMobileScribe_BuildTool.sh
+
+      # 用 ditto 而非 zip:.app 是目錄結構,ditto 才會保留 symlink 與
+      # 簽章所需的 metadata,否則解壓後的 app 會打不開。
+      # 原始碼檔名不再帶版號(見 RELEASING.md),所以版號改讀 VERSION_STR。
+      # zip 名稱格式維持不變:MMScribe.Beta.V0.52.macOS.zip
+      - name: 壓縮 Release 版
+        working-directory: Source/dist
+        run: |
+          VER="$(sed -n 's/^VERSION_STR[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+                   ../MabinogiMobileScribe_Beta.py | head -1)"
+          if [ -z "$VER" ]; then
+            echo "::error::讀不到 VERSION_STR,無法決定發布檔名"
+            exit 1
+          fi
+
+          # 打 tag 發版時順手核對。VERSION_STR 忘了跟 tag 一起更新的話,
+          # 會做出一個版號對不上 release 的 zip — 不值得中斷建置,但要講出來。
+          case "${GITHUB_REF:-}" in
+            refs/tags/*)
+              tag_num="${GITHUB_REF_NAME#v}"; tag_num="${tag_num%%-*}"
+              ver_num="${VER##*[Vv]}"
+              if [ "$tag_num" != "$ver_num" ]; then
+                echo "::warning::tag 是 ${GITHUB_REF_NAME},但 VERSION_STR 是「${VER}」— 版號不一致"
+              fi
+              ;;
+          esac
+
+          NAME="MMScribe.${VER// /.}.macOS.zip"
+          ditto -c -k --keepParent "MM Scribe.app" "$NAME"
+          echo "ZIP_NAME=$NAME" >> "$GITHUB_ENV"
+          ls -la "$NAME"
+
+      - name: 上傳為 workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: Source/dist/${{ env.ZIP_NAME }}
+
+      # 有 tag 才附到 release;手動觸發時只留 artifact。
+      #
+      # release 可能還沒建立(先 git push --tags、稍後才寫 release 說明是常見流程),
+      # 這種情況只提示不失敗 — 產物仍然保留在上面的 artifact,可以事後補上,
+      # 沒必要為此寄一封 workflow 失敗通知。
+      - name: 附加到 release
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: Source/dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$ZIP_NAME" --clobber
+            echo "已附加到 release $GITHUB_REF_NAME"
+          else
+            echo "::notice::release $GITHUB_REF_NAME 尚未建立,略過上傳。建立後可從本次 artifact 下載 $ZIP_NAME 手動附加。"
+          fi
+
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 提早失敗:tkinter 缺了的話,等打包完才發現會浪費整輪 build
+      - name: 確認 tkinter 可用
+        run: python -c "import tkinter; print('Tk', tkinter.TkVersion)"
+
+      # Brotli 是角色身分偵測的硬相依 — 少了它解不開 0x4FFF / 0x4E4F,
+      # 綁不到自己的實體 ID,傷害統計會整個空白 (見 PacketNotes_Identity §9)。
+      # 依賴版本與 macOS job 釘死成同一組。
+      - name: 安裝相依套件
+        run: python -m pip install scapy==2.7.0 customtkinter==5.2.2 Brotli==1.1.0 pyinstaller==6.21.0
+
+      # BuildTool.bat 會先後建出 Dev 與 Release 兩顆 exe,結尾有 pause;
+      # < NUL 讓 pause 直接收 EOF,CI 才不會卡住等按鍵。
+      - name: 建置 EXE
+        working-directory: Source
+        shell: cmd
+        run: MabinogiMobileScribe_BuildTool.bat < NUL
+
+      # 只發布 Release 版(與 macOS 只包 .app 同理);Dev exe 留在 artifact 之外。
+      # zip 內附預設定檔,使用者解壓即有 skills.ini / settings.ini 可直接修改。
+      # 原始碼檔名不再帶版號(見 RELEASING.md),所以版號讀 VERSION_STR。
+      # 檔名格式對照 macOS zip:MMScribe.Beta.V0.52.Windows.zip
+      - name: 壓縮 Release 版
+        working-directory: Source/dist
+        shell: pwsh
+        run: |
+          $hit = Select-String -LiteralPath ..\MabinogiMobileScribe_Beta.py `
+                   -Pattern '^\s*VERSION_STR\s*=\s*"([^"]*)"'
+          $VER = if ($hit) { $hit.Matches[0].Groups[1].Value } else { "" }
+          if (-not $VER) {
+            Write-Host "::error::讀不到 VERSION_STR,無法決定發布檔名"
+            exit 1
+          }
+
+          # 打 tag 發版時順手核對。VERSION_STR 忘了跟 tag 一起更新的話,
+          # 會做出一個版號對不上 release 的 zip — 不值得中斷建置,但要講出來。
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $tagNum = ($env:GITHUB_REF_NAME -replace '^v', '') -replace '-.*$', ''
+            $verNum = $VER -replace '^.*[Vv]', ''
+            if ($tagNum -ne $verNum) {
+              Write-Host "::warning::tag 是 $($env:GITHUB_REF_NAME),但 VERSION_STR 是「$VER」— 版號不一致"
+            }
+          }
+
+          $NAME = "MMScribe.$($VER -replace ' ', '.').Windows.zip"
+          Compress-Archive -Path "MM Scribe.exe", "..\settings.ini", "..\skills.ini" `
+            -DestinationPath $NAME -Force
+          Add-Content -Path $env:GITHUB_ENV -Value "ZIP_NAME=$NAME"
+          Get-Item $NAME
+
+      - name: 上傳為 workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: Source/dist/${{ env.ZIP_NAME }}
+
+      # 有 tag 才附到 release;手動觸發時只留 artifact。
+      #
+      # release 可能還沒建立(先 git push --tags、稍後才寫 release 說明是常見流程),
+      # 這種情況只提示不失敗 — 產物仍然保留在上面的 artifact,可以事後補上。
+      - name: 附加到 release
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: Source/dist
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 注意:GH runner 結束時會帶入最後一個原生命令的 $LASTEXITCODE,
+          # 所以「找不到 release」要明確 exit 0,否則整個 step 會被判失敗。
+          gh release view "$env:GITHUB_REF_NAME" *> $null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::notice::release $($env:GITHUB_REF_NAME) 尚未建立,略過上傳。建立後可從本次 artifact 下載 $env:ZIP_NAME 手動附加。"
+            exit 0
+          }
+          gh release upload "$env:GITHUB_REF_NAME" "$env:ZIP_NAME" --clobber
+          Write-Host "已附加到 release $($env:GITHUB_REF_NAME)"

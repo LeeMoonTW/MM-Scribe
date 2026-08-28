@@ -7,8 +7,8 @@
 #
 #  原始碼檔名不再帶版號 (見 RELEASING.md),版號的唯一來源是
 #  Source/MabinogiMobileScribe_Beta.py 裡的 VERSION_STR。本腳本負責
-#  讓 VERSION_STR 與 git tag 永遠對得上 — 這也是 build-macos.yml
-#  決定發布 zip 檔名的依據。
+#  讓 VERSION_STR 與 git tag 永遠對得上 — 這也是 build.yaml
+#  決定發布 zip / exe zip 檔名的依據。
 #
 #  用法:
 #    ./release.sh 0.53                 版號 0.53,tag 自動補成 v0.53-beta-mac
@@ -53,7 +53,7 @@ usage() {
   1. 檢查:分支、工作區乾淨、與遠端同步、tag 尚未存在
   2. 把 VERSION_STR 改成新版號並 commit(已經是新版號就跳過)
   3. 打 annotated tag
-  4. 推送分支與 tag → 觸發 .github/workflows/build-macos.yml 建置 .app
+  4. 推送分支與 tag → 觸發 .github/workflows/build.yaml 建置 .app 與 exe
   5. 建立 draft release,讓 workflow 建好的 zip 有地方掛
 
 詳細說明見 RELEASING.md
