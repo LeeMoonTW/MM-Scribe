@@ -231,7 +231,7 @@ else
     info "tag           : ${TAG}  (annotated,打在即將產生的版號 commit 上)"
 fi
 if [[ "$DO_PUSH" -eq 1 ]]; then
-    info "推送          : ${REMOTE} ${BRANCH} + ${TAG} → 觸發 macOS 建置"
+    info "推送          : ${REMOTE} ${BRANCH} + ${TAG} → 觸發 macOS + Windows 建置"
 else
     info "推送          : 略過 (--no-push)"
 fi
@@ -322,17 +322,21 @@ if [[ "$DO_PUSH" -eq 1 ]]; then
                 | sed -e 's#^git@github\.com:#https://github.com/#' \
                       -e 's#^ssh://git@github\.com/#https://github.com/#' \
                       -e 's#\.git$##')"
-            echo "  1. macOS 建置進度  : ${REPO_URL}/actions"
-            echo "  2. 建好的 zip 會自動掛到 release(約數分鐘)"
+            echo "  1. 建置進度        : ${REPO_URL}/actions  (macOS 與 Windows 並行)"
+            echo "  2. 兩包 zip 會自動掛到 release(約數分鐘)"
             echo "  3. 寫發版說明並發布: ${REPO_URL}/releases"
             ;;
         *)
             echo "  已推送 ${BRANCH} 與 ${TAG} 到 ${REMOTE}"
             ;;
     esac
-    echo
-    echo "  Windows 版 exe 仍需在 Windows 上跑 Source/MabinogiMobileScribe_BuildTool.bat,"
-    echo "  再手動附到同一個 release。"
+    # build.yaml 的上傳步驟是「release 不存在就只留 artifact」,不會失敗也不會等 —
+    # 草稿沒開成的話得在建置跑完前補上,否則兩包 zip 都只會留在 artifact 裡。
+    if [[ "$MAKE_RELEASE" != "yes" ]]; then
+        echo
+        echo "  注意:這次沒有建立 draft release。CI 找不到 release 時只會留下 artifact,"
+        echo "  請在建置完成前先手動建立 ${TAG} 的 release,zip 才掛得上去。"
+    fi
 else
     echo "  本機已完成 commit 與 tag。推送:"
     echo "    git push ${REMOTE} ${BRANCH} && git push ${REMOTE} ${TAG}"
