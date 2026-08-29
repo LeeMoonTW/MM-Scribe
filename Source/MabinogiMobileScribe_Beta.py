@@ -99,8 +99,30 @@ TARGET_BTN_IDLE = "#2a2a2a"        # 目標按鈕:未選中
 TARGET_SORT_INTERVAL_MS = 3000     # 目標按鈕列依累積傷害重排的週期
 # 攻擊日誌保留筆數上限 (切換目標時要依此緩衝重畫整份,故需有上界)
 LOG_HISTORY_MAX = 5000
+# === 傷害事件時間序列 (給日後的傷害曲線圖表用,不顯示在日誌上) ===
+# 每筆傷害存一列 (ts, target_id, skill_id, damage, flags):
+#   ts       = time.time() 絕對時間戳,與統計桶的 first/last 同一個時鐘
+#   skill_id = 抓不到時為 None
+#   flags    = DMG_EVENT_TAG_BITS 的位元 + DoT / 間接兩個高位元
+# 存成 tuple 而非 dict:一場動輒數萬筆,tuple 省下的記憶體與存檔體積都不小。
+DMG_EVENT_TAG_BITS = ("爆擊", "強擊", "破防", "無防備",
+                      "連擊", "多重打擊", "迎擊", "追擊",
+                      "延長破防", "終結")
+# DoT / 間接固定放在高位,中間留空檔 — 標籤再加也不會撞到這兩個位元
+DMG_EVENT_DOT_BIT = 1 << 16
+DMG_EVENT_SUSTAIN_BIT = 1 << 17
+# 時間序列保留筆數上限 (deque,超量自動丟最舊的)
+DMG_EVENT_MAX = 100000
 SKILL_CFG_NAME = "skills.ini"
 SETTINGS_CFG_NAME = "settings.ini"
+# 存檔 (「紀錄 / 讀取」):檔案放在 EXE (或原始碼) 旁的 Save/ 資料夾
+SAVE_DIR_NAME = "Save"
+SAVE_FILE_PREFIX = "MMScribe_"
+SAVE_FILE_EXT = ".json"
+# 存檔格式版號。欄位語意變動時 +1;讀檔遇到不認得的版號直接拒讀,
+# 免得舊檔被當成新格式塞進 target_stats,畫面數字錯得無聲無息。
+SAVE_FORMAT_VERSION = 1
+SAVE_COMBO_EMPTY = "(無存檔)"
 BPF_HELPER_NAME = "macos-bpf-access.sh"  # macOS 抓包權限設定腳本
 FONT_SCALE_MIN = 1.0
 FONT_SCALE_MAX = 2.0
@@ -286,6 +308,15 @@ def get_external_path(filename):
         return target
 
     return os.path.join(os.path.dirname(sys.executable), filename)
+
+
+def get_save_dir():
+    """存檔資料夾路徑 (不保證存在,寫入前才 makedirs)。
+    走 get_external_path 而非自己拼 __file__ —— 後者在 macOS 打包版會指向
+    .app 內部的唯讀路徑,存檔一定失敗。代價是 macOS 上實際落在
+    ~/Library/Application Support/MM Scribe/Save,不是字面上的「EXE 同資料夾」。
+    """
+    return get_external_path(SAVE_DIR_NAME)
 
 
 def load_monster_names():
@@ -634,9 +665,24 @@ def _is_never_game_traffic(name):
     return str(name).startswith(_SKIP_IFACE_PREFIXES)
 
 
+def dmg_event_flags(tags, is_dot, is_sustain):
+    """把標籤列表壓成一個整數位元遮罩 (見 DMG_EVENT_TAG_BITS)。
+    未知(...) 這種動態標籤不進遮罩 — 位元位置必須是固定語意,日後圖表才讀得懂。
+    """
+    bits = 0
+    for i, name in enumerate(DMG_EVENT_TAG_BITS):
+        if name in tags:
+            bits |= 1 << i
+    if is_dot:
+        bits |= DMG_EVENT_DOT_BIT
+    if is_sustain:
+        bits |= DMG_EVENT_SUSTAIN_BIT
+    return bits
+
+
 IP_FILTER_NET = "43.0.0.0/8"
 HIGHLIGHT_OPTIONS = ["無", "爆擊", "強擊", "破防", "無防備", "連擊", "多重打擊", "追擊",
-                     "迎擊"]
+                     "迎擊", "延長破防", "終結"]
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -726,6 +772,11 @@ class LiveDamageMonitor:
         # deque(maxlen) 超量會自動丟最舊的,不必手動修剪。
         self.log_entries = collections.deque(maxlen=LOG_HISTORY_MAX)
 
+        # 傷害時間序列:每筆傷害一列 (ts, target_id, skill_id, damage, flags)。
+        # 只寫不讀 (日誌不顯示時間戳),留給日後的傷害曲線圖表。
+        # append 在攔截執行緒上跑,deque.append 本身是 atomic 的,不另外加鎖。
+        self.damage_events = collections.deque(maxlen=DMG_EVENT_MAX)
+
         # 日誌欄寬量測用的字體 (見 _scaled_tab_stops);字體物件需要 Tk root,
         # 故延後到第一次用到時才建立
         self._log_font = None
@@ -751,6 +802,10 @@ class LiveDamageMonitor:
         # 計時器:end_time 為 None 表示無倒數;after_id 用於取消已排程的 tick
         self.timer_end_time = None
         self.timer_after_id = None
+
+        # 純檢視模式:讀取存檔後為 True,鎖住「開始/計時」直到按下「清除」
+        # (見 _set_view_only)
+        self.view_only = False
 
         # 追蹤模式旗標 (由 settings 載入,可從設定畫面切換)
         self.track_damage = self.settings["track_damage"]
@@ -1083,6 +1138,37 @@ class LiveDamageMonitor:
         if not RELEASE_BUILD:
             self.dev_strip.pack(side="bottom", fill="x", padx=10, pady=(0, 6))
 
+        # ----------------------------------------------------
+        # 7. 底部控制列: 紀錄 / 讀取存檔 (視窗最底下,診斷 LOG 的上方)
+        # ----------------------------------------------------
+        # 沒有併進 Row 1 —— 那列已經有六個元件,再塞會超出 minsize 的 400px 寬。
+        # side="bottom" 且**必須 pack 在 dev_strip 之後**:同為 bottom 時,先 pack
+        # 的貼最底邊,後 pack 的疊在它上面。理由同 dev_strip —— 中段那些
+        # expand=True 的面板 (日誌/排行/治癒) 再怎麼撐都吃不掉這一條。
+        # 發布版沒有 dev_strip,這列自然就成為最底下那條。
+        self.ctrl_row4 = ctk.CTkFrame(root, corner_radius=0)
+        self.ctrl_row4.pack(side="bottom", fill="x", padx=10, pady=(0, 3))
+        ctrl_row4 = self.ctrl_row4  # local alias,與其他控制列一致
+
+        self.btn_save = ctk.CTkButton(ctrl_row4, text="💾 紀錄", width=70, corner_radius=8,
+                                      fg_color="#5a7a9a", hover_color="#6a8aaa",
+                                      command=self.save_snapshot)
+        self.btn_save.pack(side="left", padx=(6, 2), pady=6)
+        self.btn_load = ctk.CTkButton(ctrl_row4, text="📂 讀取", width=70, corner_radius=8,
+                                      fg_color="#5a7a9a", hover_color="#6a8aaa",
+                                      command=self.load_snapshot)
+        self.btn_load.pack(side="left", padx=2, pady=6)
+        self.save_file_var = tk.StringVar(value=SAVE_COMBO_EMPTY)
+        self.save_combo = ctk.CTkComboBox(ctrl_row4, values=[SAVE_COMBO_EMPTY],
+                                          variable=self.save_file_var, state="readonly",
+                                          width=170, corner_radius=8,
+                                          font=(FONT_LOG, 11))
+        self.save_combo.pack(side="left", padx=(6, 2), pady=6)
+        # 手動丟檔進 Save/ 的人不必重開程式才看得到
+        ctk.CTkButton(ctrl_row4, text="🔄", width=32, corner_radius=8,
+                      fg_color="#4a4a4a", hover_color="#6a6a6a",
+                      command=self.refresh_save_list).pack(side="left", padx=2, pady=6)
+
         # 監聽視窗 resize,拖動期間跳過技能排行更新,結束後補刷一次
         root.bind("<Configure>", self._on_root_configure)
 
@@ -1103,6 +1189,9 @@ class LiveDamageMonitor:
 
         # 依 track_damage / track_heal 旗標,把 banner + pane 一次性 pack 到位
         self._apply_tracking_mode()
+
+        # 掃一次 Save/ 填滿存檔下拉選單 (只讀檔名,不 parse 內容)
+        self.refresh_save_list()
 
         # 開啟後自動在背景掃描一次收包網卡,結果會設到 self.chosen_iface
         # 500ms 延遲讓主視窗先完全渲染出來。
@@ -1449,7 +1538,7 @@ class LiveDamageMonitor:
         self.root.after(0, self._refresh_minsize)
 
     def _refresh_minsize(self):
-        """依「當前顯示的 banner + 3 條控制列 + status_bar」總高度,
+        """依「當前顯示的 banner + 4 條控制列 + status_bar」總高度,
         算出最小視窗高度並套用。
         - winfo_reqheight 回傳實際像素 (含 CTk scaling),要除回 font_scale 變成邏輯像素
         - **必須走 CTk 的 minsize()**,不能用 wm_minsize:CTk 會記住 minsize() 給的值,
@@ -1457,7 +1546,8 @@ class LiveDamageMonitor:
           (實測:啟動後查到的仍是 __init__ 裡那組 400x180)
         """
         self.root.update_idletasks()
-        parts = [self.ctrl_row1, self.ctrl_row2, self.ctrl_row3, self.status_bar]
+        parts = [self.ctrl_row1, self.ctrl_row2, self.ctrl_row3, self.ctrl_row4,
+                 self.status_bar]
         # 底部診斷區塊是常駐的 (發布版除外),最小高度要把它算進去
         if self.dev_strip.winfo_manager():
             parts.append(self.dev_strip)
@@ -3653,12 +3743,15 @@ class LiveDamageMonitor:
 
                         # 3. 標籤解析
                         #    b41: bit0=爆擊, bit2=無防備(排除破防), bit3=破防
+                        #         bit4+bit5 組合:0x30=延長破防, 0x20=終結
                         #         bit6=首擊(first_hit,非標籤), bit7=普通攻擊旗標(自動攻擊=1)
                         #    b42: bit0=多重打擊, bit1=強擊, bit2=連擊, bit4=迎擊
                         #         bit3+bit7=持續傷害(DoT),不當標籤,改在技能名後加註 (Dot)
                         #    b44: bit3=追擊 (未驗證,見 DMG_ADD_HIT_BIT)
                         #    b57: bit0=破防 (備援旗標)
-                        KNOWN_MASK_B41 = 0xCD
+                        # b41 bit4/bit5 只在「同時亮 bit5」時有已知語意 (0x30 / 0x20);
+                        # bit4 單獨亮還沒見過樣本,遮罩不放行,照舊報未知(b41.10)
+                        KNOWN_MASK_B41 = 0xCD | ((b41 & 0x30) if (b41 & 0x20) else 0)
                         KNOWN_MASK_B42 = 0x9F   # 原 0x8F;bit4 已確認為迎擊,不再報未知
 
                         tags = []
@@ -3676,6 +3769,11 @@ class LiveDamageMonitor:
                             tags.append("多重打擊")
                         if b42 & 0x10:
                             tags.append("迎擊")
+                        # 延長破防 / 終結:兩者共用 bit5,靠 bit4 區分,互斥
+                        if (b41 & 0x30) == 0x30:
+                            tags.append("延長破防")
+                        elif (b41 & 0x30) == 0x20:
+                            tags.append("終結")
                         # 追擊:位置來自 packet-protocol.md,尚未錄到本地樣本驗證
                         if flags[DMG_ADD_HIT_BIT[0]] & DMG_ADD_HIT_BIT[1]:
                             tags.append("追擊")
@@ -3742,6 +3840,12 @@ class LiveDamageMonitor:
                                             continue
                                         if _tn in tags:
                                             per[_tn] += 1
+
+                        # 時間序列:桶只留 first/last 兩個時間點,畫不出曲線,
+                        # 所以每筆單獨記一列 (日誌上不顯示)。
+                        self.damage_events.append(
+                            (now, target_id, skill_id, dmg_val,
+                             dmg_event_flags(tags, is_dot, is_sustain)))
 
                         # 只有這筆會影響到「目前顯示中的目標」時才重畫
                         if self.selected_target in (TARGET_ALL, target_id):
@@ -4199,7 +4303,286 @@ class LiveDamageMonitor:
             self.log("=== 計時已隨監控停止取消 ===")
         self.log("=== 已停止監控 ===")
 
-    def clear_data(self):
+    # ================================================
+    # 存檔 / 讀取 (當前數據快照)
+    #   格式為 JSON:target_stats 本來就是巢狀 dict,直接對應;人可讀,
+    #   使用者能開檔比對。不用 pickle —— 讀檔等於執行任意程式碼,
+    #   從別人手上拿到的存檔就會是攻擊面。
+    #
+    #   衍生數字 (DPS / 覆蓋率 / 技能排行 / 佔比) 一律不存:它們都是
+    #   update_dps / update_coverage / update_skill_ranking 從桶內原始累積量
+    #   現算的,存下去只會多出一份可能對不上的真相。
+    # ================================================
+    @staticmethod
+    def _enc_target_key(key):
+        """target_stats 的 key → JSON 字串。JSON 的 object key 只能是字串,
+        而這裡是 TARGET_ALL (str) 與 target_id (int) 混用。int 寫成 hex,
+        跟 UI / 開發者 log 的 0x + 8 碼慣例一致。
+        """
+        return key if isinstance(key, str) else f"0x{key:08X}"
+
+    @staticmethod
+    def _dec_target_key(key):
+        return key if key == TARGET_ALL else int(key, 16)
+
+    @staticmethod
+    def _enc_skill_map(mapping):
+        """{skill_id(int) → v} → {"0x........" → v};理由同 _enc_target_key。"""
+        return {f"0x{sid:08X}": v for sid, v in mapping.items()}
+
+    @staticmethod
+    def _dec_skill_map(mapping):
+        return {int(k, 16): v for k, v in mapping.items()}
+
+    # 桶內以 skill_id 為 key 的欄位,存/讀兩邊都要走一次 hex 轉換
+    _SKILL_KEYED = ("skill_damage", "skill_hits", "skill_cov_hits",
+                    "skill_cov_main", "skill_tags", "skill_split")
+
+    def _enc_bucket(self, b):
+        d = dict(b)
+        for name in self._SKILL_KEYED:
+            d[name] = self._enc_skill_map(b[name])
+        return d
+
+    def _dec_bucket(self, d):
+        """讀回單一統計桶。缺欄位一律沿用 _new_stat_bucket() 的預設值,
+        這樣日後往桶裡加欄位時舊存檔仍讀得進來,不必為此升 format 版號。
+        """
+        b = self._new_stat_bucket()
+        for name in ("damage", "hits", "cov_hits", "cov_main"):
+            b[name] = int(d.get(name, 0))
+        tags = d.get("tags") or {}
+        for name in COVERAGE_TAGS:
+            b["tags"][name] = int(tags.get(name, 0))
+        for name in self._SKILL_KEYED:
+            b[name] = self._dec_skill_map(d.get(name) or {})
+        # first/last 是 time.time() 的絕對時間戳,照存不動 —— DPS 只用差值,
+        # 跨天讀回來仍然正確,而且之後要顯示「這場打了多久」就有現成資料
+        b["first"] = d.get("first")
+        b["last"] = d.get("last")
+        return b
+
+    def _snapshot_dict(self):
+        """把目前狀態序列化成可寫入 JSON 的 dict。
+        不存的東西:local_player_id / 身分綁定 / chosen_iface / settings /
+        計時器狀態 —— 那些是「當前執行環境」而非數據,讀檔覆蓋會讓收包行為錯亂。
+        """
+        return {
+            "format": SAVE_FORMAT_VERSION,
+            "app_version": VERSION_STR,   # 只做顯示/診斷,相容判斷看 format
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "damage": {
+                "target_order": [f"0x{t:08X}" for t in self.target_order],
+                "selected_target": self._enc_target_key(self.selected_target),
+                "target_stats": {self._enc_target_key(k): self._enc_bucket(v)
+                                 for k, v in self.target_stats.items()},
+                # 時間序列:一筆一列陣列,欄位順序即 damage_events 的 tuple 順序。
+                # ts 只留到毫秒 (float 全精度會讓每筆多出十幾個字元,對曲線無意義)
+                "events": [[round(ts, 3), f"0x{tid:08X}",
+                            None if sid is None else f"0x{sid:08X}", dmg, flags]
+                           for ts, tid, sid, dmg, flags in self.damage_events],
+            },
+            # 治癒只存三個總量:逐行治癒日誌目前沒有結構化緩衝 (直接寫進 widget),
+            # 要一起存得先改 parse_heal_shield 的輸出路徑,這版不動
+            "heal": {"total": self.heal_total,
+                     "self": self.heal_self,
+                     "ally": self.heal_ally},
+            "log_entries": [
+                {"text": e["text"],
+                 "target": None if e["target"] is None else f"0x{e['target']:08X}",
+                 "tags": list(e["tags"]),
+                 "error": bool(e["error"]),
+                 "color": e.get("color")}
+                for e in self.log_entries],
+        }
+
+    def _parse_snapshot(self, raw):
+        """驗證並轉換存檔內容。任何欄位有問題就丟例外,由呼叫端統一報錯 ——
+        重點是「全部解析成功才回傳」,呼叫端才能保證壞檔不會把現有數據毀掉一半。
+        """
+        if not isinstance(raw, dict):
+            raise ValueError("內容不是 JSON 物件")
+        fmt = raw.get("format")
+        if fmt != SAVE_FORMAT_VERSION:
+            raise ValueError(f"格式版號 {fmt} 不支援 (本程式支援 {SAVE_FORMAT_VERSION})")
+        dmg = raw.get("damage") or {}
+        stats_raw = dmg.get("target_stats")
+        if not isinstance(stats_raw, dict) or TARGET_ALL not in stats_raw:
+            raise ValueError("缺少傷害統計資料")
+        stats = {self._dec_target_key(k): self._dec_bucket(v)
+                 for k, v in stats_raw.items()}
+        # target_order 只留 target_stats 真的有桶的 id,否則按鈕列會出現
+        # 點下去查無資料的空目標
+        order = [t for t in (int(x, 16) for x in (dmg.get("target_order") or []))
+                 if t in stats]
+        selected = self._dec_target_key(dmg.get("selected_target") or TARGET_ALL)
+        if selected != TARGET_ALL and selected not in stats:
+            selected = TARGET_ALL
+        # 時間序列:V0.53 以前的存檔沒有這欄,缺了就當空的 (讀得進來,只是畫不出曲線)
+        events = [(float(ts), int(tid, 16),
+                   None if sid is None else int(sid, 16), int(dmgv), int(flags))
+                  for ts, tid, sid, dmgv, flags in (dmg.get("events") or [])]
+        heal = raw.get("heal") or {}
+        entries = []
+        for e in (raw.get("log_entries") or []):
+            tgt = e.get("target")
+            entries.append({"text": str(e.get("text", "")),
+                            "target": None if tgt is None else int(tgt, 16),
+                            "tags": tuple(e.get("tags") or ()),
+                            "error": bool(e.get("error")),
+                            "color": e.get("color")})
+        return {
+            "saved_at": raw.get("saved_at") or "?",
+            "target_stats": stats,
+            "target_order": order,
+            "selected_target": selected,
+            "events": events,
+            "heal": (int(heal.get("total", 0)), int(heal.get("self", 0)),
+                     int(heal.get("ally", 0))),
+            "log_entries": entries,
+        }
+
+    def save_snapshot(self):
+        """把當前所有統計寫成 Save/MMScribe_<日期時間>.json。
+        檔名用 %Y%m%d_%H%M%S:字串排序即時間排序,且不含 Windows 禁用的 ':'。
+        """
+        try:
+            data = self._snapshot_dict()
+        except Exception as exc:
+            self.log_error(f"❌ 建立存檔內容失敗:{exc}")
+            return
+        save_dir = get_save_dir()
+        name = SAVE_FILE_PREFIX + time.strftime("%Y%m%d_%H%M%S")
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+            with open(os.path.join(save_dir, name + SAVE_FILE_EXT),
+                      "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+        except (OSError, TypeError, ValueError) as exc:
+            self.log_error(f"❌ 存檔失敗:{exc}")
+            return
+        self.log(f"=== 已存檔 {name} ===")
+        self.refresh_save_list(select=name)
+
+    def refresh_save_list(self, select=None):
+        """掃 Save/ 內的檔名填進下拉選單,新的排前面。
+        刻意不 parse 檔案內容 —— 檔案一多逐檔 parse 會拖慢啟動,真正的驗證留給
+        load_snapshot();壞檔的代價只是一次失敗提示,不是每次開機都變慢。
+        """
+        names = []
+        try:
+            for fn in os.listdir(get_save_dir()):
+                if fn.startswith(SAVE_FILE_PREFIX) and fn.endswith(SAVE_FILE_EXT):
+                    names.append(fn[:-len(SAVE_FILE_EXT)])
+        except OSError:
+            pass   # 資料夾還沒建立 = 還沒存過檔,不是錯誤
+        names.sort(reverse=True)   # 檔名含 %Y%m%d_%H%M%S,字串排序 = 時間排序
+        values = names or [SAVE_COMBO_EMPTY]
+        self.save_combo.configure(values=values)
+        if select and select in names:
+            self.save_file_var.set(select)
+        elif self.save_file_var.get() not in values:
+            # 原本選的檔被刪掉 (或第一次掃描) → 退回最新的一筆
+            self.save_file_var.set(values[0])
+
+    def load_snapshot(self):
+        """讀取下拉選單選中的存檔:覆蓋當前所有數據,並進入純檢視模式。"""
+        name = self.save_file_var.get()
+        if not name or name == SAVE_COMBO_EMPTY:
+            self.log_error("❌ 尚未選擇存檔")
+            return
+        path = os.path.join(get_save_dir(), name + SAVE_FILE_EXT)
+        # 先完整解析到記憶體,全部通過才動現有狀態
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                parsed = self._parse_snapshot(json.load(f))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            self.log_error(f"❌ 讀取存檔失敗:{exc}")
+            self.refresh_save_list()   # 檔案可能已被手動刪除,順手重掃
+            return
+        # 覆蓋是不可逆的:當前有數據才攔一道確認,空的就直接讀
+        if self.target_stats[TARGET_ALL]["hits"] > 0:
+            self._show_load_confirm(name, parsed)
+        else:
+            self._apply_snapshot(name, parsed)
+
+    def _show_load_confirm(self, name, parsed):
+        """覆蓋整個視窗的確認框 (作法同 show_disclaimer)。已顯示時不重複建立。"""
+        if getattr(self, "_load_confirm_overlay", None) is not None:
+            return
+        overlay = ctk.CTkFrame(self.root, fg_color="#0a0a0a", corner_radius=0)
+        overlay.place(x=0, y=0, relwidth=1, relheight=1)
+        self._load_confirm_overlay = overlay
+
+        box = ctk.CTkFrame(overlay, fg_color="#1a1a1a", corner_radius=10)
+        box.place(relx=0.5, rely=0.5, anchor="center")
+        ctk.CTkLabel(box, text="⚠ 覆蓋目前數據?",
+                     font=(FONT_UI, 15), text_color="#ff9944").pack(padx=24, pady=(18, 6))
+        ctk.CTkLabel(box, justify="left", font=(FONT_UI, 12), text_color="#cccccc",
+                     text=(f"即將載入:{name}\n"
+                           f"存檔時間:{parsed['saved_at']}\n\n"
+                           "目前尚未存檔的數據將被覆蓋且無法復原。")
+                     ).pack(padx=24, pady=(0, 14))
+        btn_row = ctk.CTkFrame(box, fg_color="transparent")
+        btn_row.pack(padx=24, pady=(0, 18))
+
+        def confirm():
+            self._hide_load_confirm()
+            self._apply_snapshot(name, parsed)
+
+        ctk.CTkButton(btn_row, text="取消", width=90, corner_radius=8,
+                      fg_color="#4a4a4a", hover_color="#6a6a6a",
+                      command=self._hide_load_confirm).pack(side="left", padx=6)
+        ctk.CTkButton(btn_row, text="覆蓋並讀取", width=110, corner_radius=8,
+                      fg_color="#c94a4a", hover_color="#e05a5a",
+                      command=confirm).pack(side="left", padx=6)
+
+    def _hide_load_confirm(self):
+        overlay = getattr(self, "_load_confirm_overlay", None)
+        if overlay is not None:
+            overlay.destroy()
+            self._load_confirm_overlay = None
+
+    def _apply_snapshot(self, name, parsed):
+        """停止監控 → 歸零 → 灌入存檔 → 重畫 → 鎖成純檢視模式。"""
+        # 攔截執行緒 (_ensure_sniffer) 是常駐的,身分偵測靠它一直收,不能停;
+        # is_monitoring=False 就足以讓 parse_payload 停止累加。
+        if self.is_monitoring:
+            self.stop_monitoring()
+        self._reset_stats(clear_dev=False)
+
+        self.target_stats = parsed["target_stats"]
+        self.target_order[:] = parsed["target_order"]
+        self.selected_target = parsed["selected_target"]
+        self.heal_total, self.heal_self, self.heal_ally = parsed["heal"]
+        self.log_entries.extend(parsed["log_entries"])
+        self.damage_events.extend(parsed["events"])
+
+        self._refresh_target_options()
+        self._refresh_stats_view()
+        self._render_log()
+        self._update_heal_banner()
+        self._set_view_only(True)
+        self.log(f"=== 已讀取存檔 {name} (存於 {parsed['saved_at']}) ===")
+        self.log("=== 純檢視模式:按「🧹 清除」可恢復偵測 ===")
+
+    def _set_view_only(self, on):
+        """純檢視模式:讀取存檔後鎖住「開始 / 計時」。
+        理由:存檔的 first/last 是當時的絕對時間戳,直接續接會讓 DPS 分母變成
+        好幾天,數字無聲無息地歸零。與其偷偷重設起點,不如把語意講清楚 ——
+        讀檔就是看數據,要重新偵測請先按「清除」。
+        """
+        self.view_only = on
+        # 監控進行中時「開始」本來就該是 disabled,不能被這裡放行
+        self.btn_start.configure(
+            state="disabled" if (on or self.is_monitoring) else "normal")
+        self.btn_timer.configure(state="disabled" if on else "normal")
+
+    def _reset_stats(self, clear_dev=True):
+        """把統計 / 日誌 / 治癒總量全部歸零,不寫任何日誌訊息。
+        clear_data 與「讀取存檔」共用 —— 後者傳 clear_dev=False,因為診斷 LOG
+        記的是「這次執行」的收包狀況,不屬於存檔要覆蓋的數據。
+        """
         # === 傷害端 ===
         # 所有目標桶一起丟掉並退回 All,下一場重新累積
         self.target_stats = {TARGET_ALL: self._new_stat_bucket()}
@@ -4223,6 +4606,7 @@ class LiveDamageMonitor:
 
         # 事件緩衝與畫面一起清 (只清 widget 的話切換目標會把舊事件叫回來)
         self.log_entries.clear()
+        self.damage_events.clear()
         self._render_log()
 
         self.heal_log_area.configure(state="normal")
@@ -4230,16 +4614,21 @@ class LiveDamageMonitor:
         self.heal_log_area.configure(state="disabled")
 
         # 診斷視窗可能沒開;緩衝與底部單行也要一起清,免得重開後舊資料又冒出來
-        self._dev_lines.clear()
-        try:
-            self.dev_strip.configure(text=DEV_STRIP_EMPTY)
-        except Exception:
-            pass
-        if self.dev_log_area is not None:
-            self.dev_log_area.configure(state="normal")
-            self.dev_log_area.delete("1.0", "end")
-            self.dev_log_area.configure(state="disabled")
+        if clear_dev:
+            self._dev_lines.clear()
+            try:
+                self.dev_strip.configure(text=DEV_STRIP_EMPTY)
+            except Exception:
+                pass
+            if self.dev_log_area is not None:
+                self.dev_log_area.configure(state="normal")
+                self.dev_log_area.delete("1.0", "end")
+                self.dev_log_area.configure(state="disabled")
 
+    def clear_data(self):
+        self._reset_stats()
+        # 「清除」是離開純檢視模式的唯一出口 (見 _set_view_only)
+        self._set_view_only(False)
         self.log("=== 數據已歸零 ===")
         # 注意:身分/綁定不清零 — 清了就得等下次換地圖才會再認出自己,
         # 中間所有傷害都不會被記錄 (同 local_player_id 的處置)。
