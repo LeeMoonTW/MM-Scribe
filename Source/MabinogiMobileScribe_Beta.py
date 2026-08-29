@@ -23,9 +23,12 @@ macOS 上遊戲為 iOS App on Mac,流量直接走實體網卡,抓法與 Windows 
 """
 import collections
 import configparser
+import csv
+import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -115,6 +118,8 @@ DMG_EVENT_SUSTAIN_BIT = 1 << 17
 DMG_EVENT_MAX = 100000
 SKILL_CFG_NAME = "skills.ini"
 SETTINGS_CFG_NAME = "settings.ini"
+# 代理模式偵測用的遊戲執行檔名 (小寫比對)。可由 settings.ini 的 [Network] 覆寫
+DEFAULT_GAME_PROCESSES = ("mabinogimobile.exe",)
 # 存檔 (「紀錄 / 讀取」):檔案放在 EXE (或原始碼) 旁的 Save/ 資料夾
 SAVE_DIR_NAME = "Save"
 SAVE_FILE_PREFIX = "MMScribe_"
@@ -446,6 +451,9 @@ def load_settings():
         "track_heal": False,
         "popout_log": False,
         "popout_skill": False,
+        # 代理模式偵測要比對的遊戲執行檔名 (見 detect_local_game_proxy)。
+        # 官方哪天改檔名時,使用者自己改 ini 就能救,不必等新版 exe。
+        "game_processes": DEFAULT_GAME_PROCESSES,
     }
     path = get_external_path(SETTINGS_CFG_NAME)
     if not os.path.exists(path):
@@ -480,6 +488,14 @@ def load_settings():
         result["popout_skill"] = parser.getboolean("Layout", "popout_skill", fallback=False)
     except (ValueError, configparser.Error):
         pass
+    try:
+        raw = parser.get("Network", "game_processes",
+                         fallback=",".join(DEFAULT_GAME_PROCESSES))
+        names = tuple(n.strip().lower() for n in raw.split(",") if n.strip())
+        # 整行被清空時退回預設,否則代理偵測會永遠比對不到任何行程
+        result["game_processes"] = names or DEFAULT_GAME_PROCESSES
+    except (ValueError, configparser.Error):
+        pass
     return result
 
 
@@ -498,6 +514,11 @@ def save_settings(settings):
     parser["Layout"] = {
         "popout_log": "true" if settings.get("popout_log", False) else "false",
         "popout_skill": "true" if settings.get("popout_skill", False) else "false",
+    }
+    # 這裡是整檔覆寫,不寫回去的話使用者手改的行程名會被下一次存檔洗掉
+    parser["Network"] = {
+        "game_processes": ",".join(
+            settings.get("game_processes") or DEFAULT_GAME_PROCESSES),
     }
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -681,6 +702,112 @@ def dmg_event_flags(tags, is_dot, is_sustain):
 
 
 IP_FILTER_NET = "43.0.0.0/8"
+DEFAULT_BPF_FILTER = f"ip net {IP_FILTER_NET} and tcp"
+
+
+# ================================================
+# 本機代理 / 加速器偵測 (Windows)
+#   奇游那類加速器會用 TUN 把遊戲連線整個接管,改接到本機的代理端口
+#   (netstat 會看到遊戲行程連往 127.x 或本機 TUN 位址,例如 172.18.0.1:49335)。
+#   這種情況下真實伺服器 IP (43.0.0.0/8) 不會出現在「任何」網卡的封包裡,
+#   唯一看得到明文遊戲協議的位置,是 Loopback 上「遊戲 ↔ 代理端口」的往返流量。
+#   ⚠ 未驗證:尚無實際加速器環境的封包樣本,以下推論待樣本佐證。
+# ================================================
+def _run_hidden(cmd):
+    """跑外部命令並取回 stdout。打包成 --noconsole 時不會閃出黑窗。"""
+    kwargs = {"text": True, "errors": "replace", "stderr": subprocess.DEVNULL}
+    if IS_WINDOWS:
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        kwargs["startupinfo"] = si
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return subprocess.check_output(cmd, **kwargs)
+
+
+def detect_local_game_proxy(process_names=None):
+    """偵測遊戲流量是否被本機代理 (加速器 / VPN) 接管。
+
+    回傳 (代理端口 set, 代理程式名說明);遊戲沒開、直連伺服器、或偵測失敗都回 None。
+    """
+    if not IS_WINDOWS:
+        return None
+    names = tuple(n.lower() for n in (process_names or DEFAULT_GAME_PROCESSES))
+    try:
+        # 1) tasklist CSV → 找遊戲行程 PID。用 CSV 而非表格輸出,欄位位置才不受
+        #    系統語言影響 (中文版 Windows 的表頭寬度跟英文版不一樣)
+        pid_name = {}
+        for row in csv.reader(io.StringIO(
+                _run_hidden(["tasklist", "/FO", "CSV", "/NH"]))):
+            if len(row) >= 2 and row[1].isdigit():
+                pid_name[row[1]] = row[0]
+        game_pids = {p for p, n in pid_name.items() if n.lower() in names}
+        if not game_pids:
+            return None
+
+        # 2) 本機自有 IPv4 — 代理常綁在 TUN 位址 (如 172.18.0.1) 而非 127.0.0.1
+        local_ips = {"127.0.0.1"}
+        try:
+            for itf in list_network_ifaces():
+                for ip in (itf.get("ips") or []):
+                    if ":" not in str(ip):
+                        local_ips.add(str(ip))
+        except Exception:
+            pass
+
+        # 3) netstat 一次撈完,順手記下每個監聽端口屬於哪個 PID (用來報代理程式名)
+        rows, listen_pid = [], {}
+        for line in _run_hidden(["netstat", "-ano", "-p", "TCP"]).splitlines():
+            parts = line.split()
+            if len(parts) != 5 or parts[0].upper() != "TCP":
+                continue
+            rows.append(parts)
+            if parts[3].upper() == "LISTENING":
+                listen_pid[parts[1].rsplit(":", 1)[-1]] = parts[4]
+
+        # 遊戲行程自己持有的本地端點 — 用來排除遊戲連自己的內部 IPC
+        game_locals = {local for _, local, _, state, pid in rows
+                       if state.upper() == "ESTABLISHED" and pid in game_pids}
+
+        proxy_ports = set()
+        for _, local, remote, state, pid in rows:
+            if state.upper() != "ESTABLISHED" or pid not in game_pids:
+                continue
+            rip, _, rport = remote.rpartition(":")
+            if rip.startswith("43."):
+                return None  # 有直連伺服器的連線 → 不需要代理模式
+            if rip in local_ips and rport.isdigit() and remote not in game_locals:
+                proxy_ports.add(int(rport))
+        if not proxy_ports:
+            return None
+
+        pnames = sorted({pid_name.get(listen_pid.get(str(p), ""), "")
+                         for p in proxy_ports} - {""})
+        return proxy_ports, (", ".join(pnames) or "未知代理程式")
+    except Exception:
+        return None
+
+
+def find_loopback_iface():
+    """回傳可用於擷取本機往返流量的介面 dict,找不到回 None。
+
+    Npcap 的 loopback 裝置 (\\Device\\NPF_Loopback) 不一定會掛上 127.0.0.1,
+    所以名稱與 IP 兩種特徵都比對,只認 IP 會在裝好的機器上誤報「沒裝」。
+    """
+    try:
+        ifaces = list_network_ifaces()
+    except Exception:
+        return None
+    for itf in ifaces:
+        if "127.0.0.1" in [str(ip) for ip in (itf.get("ips") or [])]:
+            return itf
+    for itf in ifaces:
+        text = f"{itf.get('name') or ''} {itf.get('description') or ''}".lower()
+        if "loopback" in text or "npf_loopback" in text:
+            return itf
+    return None
+
+
 HIGHLIGHT_OPTIONS = ["無", "爆擊", "強擊", "破防", "無防備", "連擊", "多重打擊", "追擊",
                      "迎擊", "延長破防", "終結"]
 
@@ -798,6 +925,9 @@ class LiveDamageMonitor:
 
         # 自動選定的收包網卡 (由掃描結果決定,None = 讓 scapy 用預設)
         self.chosen_iface = None
+        # sniff 用的 BPF 過濾條件。預設抓 43/8 直連流量;偵測到加速器代理時
+        # 由 _apply_chosen_iface 換成「tcp 代理端口」(見 _scan_ifaces_for_traffic)
+        self.sniff_filter = DEFAULT_BPF_FILTER
 
         # 計時器:end_time 為 None 表示無倒數;after_id 用於取消已排程的 tick
         self.timer_end_time = None
@@ -1687,6 +1817,51 @@ class LiveDamageMonitor:
                             and str(ip) != "0.0.0.0"
                             and not str(ip).startswith("169.254.")]
 
+                # ── 代理模式:加速器把遊戲連線接到本機端口時,43/8 流量在任何
+                # 網卡上都不存在,唯一看得到的位置是 Loopback 上的往返流量 ──
+                proxy = detect_local_game_proxy(self.settings.get("game_processes"))
+                if proxy:
+                    ports, pdesc = proxy
+                    port_str = ", ".join(str(p) for p in sorted(ports))
+                    flt = ("tcp and ("
+                           + " or ".join(f"port {p}" for p in sorted(ports)) + ")")
+                    lo = find_loopback_iface()
+                    if lo is None:
+                        self.root.after(0, lambda d=pdesc: on_progress(
+                            "warn", f"偵測到本機網路代理 ({d}),但找不到 Loopback 擷取介面",
+                            "請重新安裝 Npcap 並勾選「Support loopback traffic」",
+                            "先改用一般網卡掃描"))
+                    else:
+                        lo_name = str(lo.get("description") or lo.get("name") or "Loopback")
+                        # 用 active 而非 info:這是要讓使用者看到的狀態切換,
+                        # info 會被啟動流程的日誌過濾當成逐張網卡的細節擋掉
+                        self.root.after(0, lambda d=pdesc, p=port_str: on_progress(
+                            "active", f"偵測到本機網路代理 ({d})",
+                            f"遊戲連線被接到本機 port {p},改掃 Loopback"))
+                        count = 0
+                        try:
+                            # loopback 上的遊戲封包比實體網卡稀疏 (只有真的在傳資料
+                            # 才有),掃太短容易誤判成沒有
+                            count = len(_sniff(iface=lo.get("name"), filter=flt,
+                                               timeout=max(per_iface_timeout, 3),
+                                               store=True))
+                        except Exception as e:
+                            self.root.after(0, lambda n=lo_name, err=e: on_progress(
+                                "warn", f"{n}", f"sniff 失敗: {err}"))
+                        if count > 0:
+                            chosen = dict(lo)
+                            chosen["description"] = (
+                                f"Loopback 代理模式 — {pdesc} (port {port_str})")
+                            chosen["_filter"] = flt
+                            self.root.after(0, lambda d=chosen["description"], c=count:
+                                            on_progress("ok", f"✓ {d}",
+                                                        f"收到 {c} 個目標封包"))
+                            self.root.after(0, lambda c=chosen, cnt=count: on_done(
+                                c, [(c, cnt, c["description"])]))
+                            return
+                        self.root.after(0, lambda: on_progress(
+                            "warn", "Loopback 沒收到遊戲封包", "改用一般網卡掃描"))
+
                 try:
                     raw_ifs = list_network_ifaces()
                 except Exception as e:
@@ -1716,8 +1891,7 @@ class LiveDamageMonitor:
                     name = str(iface.get("description") or iface.get("name") or "?")
                     iface_key = iface.get("name")
                     try:
-                        pkts = _sniff(iface=iface_key,
-                                      filter=f"ip net {IP_FILTER_NET} and tcp",
+                        pkts = _sniff(iface=iface_key, filter=DEFAULT_BPF_FILTER,
                                       timeout=per_iface_timeout, store=True)
                         count = len(pkts)
                     except Exception as e:
@@ -1750,11 +1924,14 @@ class LiveDamageMonitor:
         threading.Thread(target=_worker, daemon=True).start()
 
     def _apply_chosen_iface(self, iface_dict):
-        """把掃描結果套用到 self.chosen_iface,之後 sniff() 就會綁這張卡。"""
-        prev = self.chosen_iface
+        """把掃描結果套用到 self.chosen_iface / self.sniff_filter,
+        之後 sniff() 就會用這組網卡與過濾條件。"""
+        prev = (self.chosen_iface, self.sniff_filter)
         self.chosen_iface = None if iface_dict is None else iface_dict.get("name")
-        # 攔截執行緒是常駐的 (見 _ensure_sniffer),換卡要重開一條才會綁到新的
-        if self.chosen_iface != prev:
+        # 代理模式的掃描結果會多帶一個 _filter (掃 loopback 上的代理端口)
+        self.sniff_filter = (iface_dict or {}).get("_filter") or DEFAULT_BPF_FILTER
+        # 攔截執行緒是常駐的 (見 _ensure_sniffer),換卡或換過濾條件都要重開一條
+        if (self.chosen_iface, self.sniff_filter) != prev:
             self._ensure_sniffer(restart=True)
 
     # ================================================
@@ -1924,12 +2101,13 @@ class LiveDamageMonitor:
 
         def on_progress(status, title, *details):
             # 僅把有意義的訊息推到主日誌 (略過每張介面的細節,避免刷屏)
-            if status in ("ok", "warn"):
+            if status in ("ok", "warn", "active"):
                 self.log(f"  {title}")
 
         def on_done(best_iface, hits):
             if best_iface is None:
-                self.log("=== 未偵測到目標網段封包,將使用 scapy 預設介面 ===")
+                self.log("=== 無法獲取遊戲封包,可能是使用加速器/VPN等網路代理 ===")
+                self.log("    將先使用 scapy 預設介面")
                 self.log("    若監控後仍抓不到,請按「網路檢測 → 掃描收包網卡」重試")
             else:
                 self._apply_chosen_iface(best_iface)
@@ -1955,12 +2133,13 @@ class LiveDamageMonitor:
         def on_done(best_iface, hits):
             if best_iface is None:
                 self._append_netcheck(
-                    "warn", "掃描結束:所有介面都沒收到目標封包",
+                    "warn", "無法獲取遊戲封包,可能是使用加速器/VPN等網路代理",
                     "可能原因:",
-                    "  1. 遊戲未連線 / 未啟動",
-                    "  2. 目標伺服器不在監控範圍內",
-                    "  3. 沒有以系統管理員身分執行 → sniff 靜默失敗",
-                    "  4. 防毒/防火牆阻擋")
+                    "  1. 加速器/VPN 接管了遊戲連線 → 請先關閉後重試",
+                    "  2. 遊戲未連線 / 未啟動",
+                    "  3. 目標伺服器不在監控範圍內",
+                    "  4. 沒有以系統管理員身分執行 → sniff 靜默失敗",
+                    "  5. 防毒/防火牆阻擋")
             else:
                 self._apply_chosen_iface(best_iface)
                 name = str(best_iface.get("description") or best_iface.get("name") or "?")
@@ -4162,7 +4341,7 @@ class LiveDamageMonitor:
         self.sniff_thread.start()
 
     def sniff_packets(self, gen=0):
-        bpf_filter = f"ip net {IP_FILTER_NET} and tcp"
+        bpf_filter = self.sniff_filter
         try:
             sniff_kwargs = {
                 "filter": bpf_filter,
