@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  MM Scribe - Build Dev + Release .app (macOS)
+#  MM Scribe - Build Dev + Release .app + Graph viewer (macOS)
 #  Usage: ./MabinogiMobileScribe_BuildTool.sh
 #
 #  對應 Windows 版的 MabinogiMobileScribe_BuildTool.bat,行為刻意保持一致:
@@ -15,7 +15,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 cleanup() {
-    rm -f RELEASE.marker
+    rm -f RELEASE.marker VERSION.txt
 }
 trap cleanup EXIT
 
@@ -31,6 +31,11 @@ if [[ -z "$SCRIPT" ]]; then
     exit 1
 fi
 echo "Detected source: $SCRIPT"
+
+# ---- 圖表閱覽器 (選用):原始碼在才建置 ----
+GRAPH="MabinogiMobileScribeGraph_Beta.py"
+[[ -f "$GRAPH" ]] || GRAPH=""
+echo "Detected graph : ${GRAPH:-none - skipping graph build}"
 
 # ---- Python:優先用專案的 venv,沒有就退回 PATH 上的 python3 ----
 PY="../.venv/bin/python"
@@ -81,10 +86,10 @@ echo "Bundled configs  : ${CONFIGS[*]:-none}"
 echo
 
 # ---- Clean previous build artifacts so PyInstaller does not reuse cached spec ----
-rm -rf build "MM Scribe.spec" "MM Scribe Dev.spec"
+rm -rf build "MM Scribe.spec" "MM Scribe Dev.spec" "MM Scribe Graph.spec"
 
 echo "============================================================"
-echo " Step 1/3 : Build DEV version (with developer options)"
+echo " Step 1/4 : Build DEV version (with developer options)"
 echo "============================================================"
 "$PY" -m PyInstaller --windowed --noconfirm \
     --collect-data customtkinter \
@@ -94,14 +99,14 @@ echo "============================================================"
 
 echo
 echo "============================================================"
-echo " Step 2/3 : Create release marker"
+echo " Step 2/4 : Create release marker"
 echo "============================================================"
 : > RELEASE.marker
 echo "Marker created."
 
 echo
 echo "============================================================"
-echo " Step 3/3 : Build RELEASE version (developer options hidden)"
+echo " Step 3/4 : Build RELEASE version (developer options hidden)"
 echo "============================================================"
 "$PY" -m PyInstaller --windowed --noconfirm \
     --collect-data customtkinter \
@@ -112,9 +117,30 @@ echo "============================================================"
 
 echo
 echo "============================================================"
+echo " Step 4/4 : Build Graph viewer (no Dev variant needed)"
+echo "============================================================"
+if [[ -n "$GRAPH" ]]; then
+    # 版號跟著主程式的 VERSION_STR 走:圖表程式會去讀隔壁的主程式原始碼,
+    # 所以這裡 import 它拿到的就是同一個來源。打包進去,EXE/.app 才知道自己是哪一版。
+    "$PY" -c "import MabinogiMobileScribeGraph_Beta as g;open('VERSION.txt','w').write(g.VERSION_STR)"
+    echo "Graph version : $(cat VERSION.txt)"
+    "$PY" -m PyInstaller --windowed --noconfirm \
+        --collect-data customtkinter \
+        --add-data "VERSION.txt:." \
+        "${ICON_REL[@]}" "${ADD_ICON_REL[@]}" "${CONFIGS[@]}" \
+        --name "MM Scribe Graph" \
+        "$GRAPH"
+    rm -f VERSION.txt
+else
+    echo "Skipped - graph source not found."
+fi
+
+echo
+echo "============================================================"
 echo " DONE!"
 echo "    Dev     : dist/MM Scribe Dev.app"
 echo "    Release : dist/MM Scribe.app"
+[[ -n "$GRAPH" ]] && echo "    Graph   : dist/MM Scribe Graph.app"
 echo
 echo " 只有 ad-hoc 簽章,使用者首次開啟會被 Gatekeeper 攔下,"
 echo " 需執行 xattr -dr com.apple.quarantine \"<路徑>/MM Scribe.app\","

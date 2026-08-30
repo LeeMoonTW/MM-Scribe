@@ -40,6 +40,9 @@ jobs:
       # 簽章所需的 metadata,否則解壓後的 app 會打不開。
       # 原始碼檔名不再帶版號(見 RELEASING.md),所以版號改讀 VERSION_STR。
       # zip 名稱格式維持不變:MMScribe.Beta.V0.52.macOS.zip
+      # 內容物:主程式 + 圖表閱覽器(MM Scribe Graph.app,版號跟著主程式走)。
+      # 兩個 .app 先收進暫存資料夾再一次 ditto —— archive 模式只吃一個來源,
+      # 不加 --keepParent 打包資料夾內容,解壓後兩個 app 仍在 zip 根目錄。
       - name: 壓縮 Release 版
         working-directory: Source/dist
         run: |
@@ -63,7 +66,15 @@ jobs:
           esac
 
           NAME="MMScribe.${VER// /.}.macOS.zip"
-          ditto -c -k --keepParent "MM Scribe.app" "$NAME"
+          rm -rf pack && mkdir pack
+          ditto "MM Scribe.app" "pack/MM Scribe.app"
+          if [ -d "MM Scribe Graph.app" ]; then
+            ditto "MM Scribe Graph.app" "pack/MM Scribe Graph.app"
+          else
+            echo "::warning::找不到 MM Scribe Graph.app,zip 內不含圖表閱覽器"
+          fi
+          ditto -c -k pack "$NAME"
+          rm -rf pack
           echo "ZIP_NAME=$NAME" >> "$GITHUB_ENV"
           ls -la "$NAME"
 
@@ -119,6 +130,7 @@ jobs:
         run: MabinogiMobileScribe_BuildTool.bat < NUL
 
       # 只發布 Release 版(與 macOS 只包 .app 同理);Dev exe 留在 artifact 之外。
+      # 圖表閱覽器 (MM Scribe Graph.exe) 沒有 Dev/Release 之分,直接收進來。
       # zip 內附預設定檔,使用者解壓即有 skills.ini / settings.ini 可直接修改。
       # 原始碼檔名不再帶版號(見 RELEASING.md),所以版號讀 VERSION_STR。
       # 檔名格式對照 macOS zip:MMScribe.Beta.V0.52.Windows.zip
@@ -145,8 +157,13 @@ jobs:
           }
 
           $NAME = "MMScribe.$($VER -replace ' ', '.').Windows.zip"
-          Compress-Archive -Path "MM Scribe.exe", "..\settings.ini", "..\skills.ini" `
-            -DestinationPath $NAME -Force
+          $items = @("MM Scribe.exe", "..\settings.ini", "..\skills.ini")
+          if (Test-Path "MM Scribe Graph.exe") {
+            $items += "MM Scribe Graph.exe"
+          } else {
+            Write-Host "::warning::找不到 MM Scribe Graph.exe,zip 內不含圖表閱覽器"
+          }
+          Compress-Archive -Path $items -DestinationPath $NAME -Force
           Add-Content -Path $env:GITHUB_ENV -Value "ZIP_NAME=$NAME"
           Get-Item $NAME
 

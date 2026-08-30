@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM  MM Scribe - Build Dev + Release EXE
+REM  MM Scribe - Build Dev + Release EXE + Graph viewer
 REM  Usage: double-click, or run in cmd
 REM ============================================================
 setlocal
@@ -24,6 +24,12 @@ if not defined SCRIPT (
 )
 
 echo Detected source: %SCRIPT%
+
+REM ---- Graph viewer (optional): built only if the source is present ----
+set "GRAPH="
+if exist "MabinogiMobileScribeGraph_Beta.py" set "GRAPH=MabinogiMobileScribeGraph_Beta.py"
+if defined GRAPH     echo Detected graph : %GRAPH%
+if not defined GRAPH echo Detected graph : none - skipping graph build
 echo.
 
 REM ---- Auto-detect icon files. Use set "VAR=..." form to avoid trailing spaces ----
@@ -50,9 +56,10 @@ REM ---- Clean previous build artifacts so PyInstaller does not reuse cached spe
 if exist "build" rmdir /s /q "build" >nul 2>&1
 if exist "MM Scribe.spec" del "MM Scribe.spec" >nul 2>&1
 if exist "MM Scribe Dev.spec" del "MM Scribe Dev.spec" >nul 2>&1
+if exist "MM Scribe Graph.spec" del "MM Scribe Graph.spec" >nul 2>&1
 
 echo ============================================================
-echo  Step 1/3 : Build DEV version (with developer options)
+echo  Step 1/4 : Build DEV version (with developer options)
 echo ============================================================
 python -m PyInstaller --onefile --noconsole ^
     --collect-data customtkinter ^
@@ -64,14 +71,14 @@ if errorlevel 1 goto :error
 
 echo.
 echo ============================================================
-echo  Step 2/3 : Create release marker
+echo  Step 2/4 : Create release marker
 echo ============================================================
 type nul > RELEASE.marker
 echo Marker created.
 
 echo.
 echo ============================================================
-echo  Step 3/3 : Build RELEASE version (developer options hidden)
+echo  Step 3/4 : Build RELEASE version (developer options hidden)
 echo ============================================================
 python -m PyInstaller --onefile --noconsole ^
     --collect-data customtkinter ^
@@ -87,9 +94,38 @@ del RELEASE.marker >nul 2>&1
 
 echo.
 echo ============================================================
+echo  Step 4/4 : Build Graph viewer (no Dev variant needed)
+echo ============================================================
+if not defined GRAPH (
+    echo Skipped - graph source not found.
+    goto :done
+)
+
+REM  Version follows the main program's VERSION_STR. The graph reads it from the
+REM  source next door, so importing it here gives the same single source of truth;
+REM  PyInstaller bundles the result so the packed EXE knows its version too.
+python -c "import MabinogiMobileScribeGraph_Beta as g;open('VERSION.txt','w').write(g.VERSION_STR)"
+if errorlevel 1 goto :error
+set /p GRAPH_VER=<VERSION.txt
+echo Graph version : %GRAPH_VER%
+
+python -m PyInstaller --onefile --noconsole ^
+    --collect-data customtkinter ^
+    --add-data "VERSION.txt;." ^
+    %ICON_REL% ^
+    %ADD_ICON_REL% ^
+    --name "MM Scribe Graph" ^
+    "%GRAPH%"
+if errorlevel 1 goto :error
+del VERSION.txt >nul 2>&1
+
+:done
+echo.
+echo ============================================================
 echo  DONE!
 echo    Dev     : dist\MM Scribe Dev.exe
 echo    Release : dist\MM Scribe.exe
+if defined GRAPH echo    Graph   : dist\MM Scribe Graph.exe
 echo ============================================================
 pause
 exit /b 0
@@ -100,5 +136,6 @@ echo ============================================================
 echo  BUILD FAILED - Check error messages above
 echo ============================================================
 if exist RELEASE.marker del RELEASE.marker >nul 2>&1
+if exist VERSION.txt del VERSION.txt >nul 2>&1
 pause
 exit /b 1
