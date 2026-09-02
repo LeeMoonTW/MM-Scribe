@@ -4352,9 +4352,13 @@ class LiveDamageMonitor:
             # 若已由開機自動偵測 or 手動掃描選定網卡,就綁在那張;否則交給 scapy 自選
             if self.chosen_iface:
                 sniff_kwargs["iface"] = self.chosen_iface
-            sniff(**sniff_kwargs)
+            sniff(promisc=False, **kwargs)
         except Exception as e:
-            self.root.after(0, lambda err=e: self.log(f"❌ 攔截錯誤: {err}"))
+            self.root.after(f"以非 promiscuous 模式擷取失敗 ({e}),改用預設模式重試")
+            try:
+                sniff(**sniff_kwargs)
+            except Exception as e:
+                self.root.after(0, lambda err=e: self.log(f"❌ 攔截錯誤: {err}"))
 
     def start_monitoring(self):
         self.is_monitoring = True
