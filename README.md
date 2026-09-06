@@ -200,7 +200,7 @@ python -m PyInstaller --onefile --noconsole --collect-data customtkinter Mabinog
 
 ```bash
 type nul > RELEASE.marker
-python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." MabinogiMobileScribe_Beta.py
+python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." --add-data "..\Note\Ref\notice_monster_names_tw.json;." MabinogiMobileScribe_Beta.py
 ```
 
 ### macOS
@@ -209,7 +209,7 @@ python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-d
 
 ```bash
 touch RELEASE.marker
-python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta.py
+python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." --add-data "../Note/Ref/notice_monster_names_tw.json:." MabinogiMobileScribe_Beta.py
 ```
 
 PyInstaller 只會做 ad-hoc 簽章（沒有 Team ID），因此 `.app` 一定會被 Gatekeeper 攔下，

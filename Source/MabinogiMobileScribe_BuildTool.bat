@@ -46,6 +46,15 @@ if exist "icon.ico"     set "ADD_ICON_REL=--add-data=icon.ico;."
 if exist "icon.ico" if not defined ICON_DEV     set "ICON_DEV=--icon=icon.ico"
 if exist "icon.ico" if not defined ADD_ICON_DEV set "ADD_ICON_DEV=--add-data=icon.ico;."
 
+REM ---- Monster name table: the target bar can only show a monster name instead
+REM      of a raw entityId when this is bundled. Missing it degrades to hex, so a
+REM      missing file is not a build failure. Main program only - the graph viewer
+REM      reads target names out of the save file.
+set "ADD_MOBNAMES="
+if exist "..\Note\Ref\notice_monster_names_tw.json" set "ADD_MOBNAMES=--add-data=..\Note\Ref\notice_monster_names_tw.json;."
+if defined ADD_MOBNAMES     echo Monster names    : bundled
+if not defined ADD_MOBNAMES echo Monster names    : NOT FOUND - target bar will show hex only
+
 if defined ICON_DEV     echo Icon for Dev     : %ICON_DEV%
 if not defined ICON_DEV echo Icon for Dev     : none - using default
 if defined ICON_REL     echo Icon for Release : %ICON_REL%
@@ -65,6 +74,7 @@ python -m PyInstaller --onefile --noconsole ^
     --collect-data customtkinter ^
     %ICON_DEV% ^
     %ADD_ICON_DEV% ^
+    %ADD_MOBNAMES% ^
     --name "MM Scribe Dev" ^
     "%SCRIPT%"
 if errorlevel 1 goto :error
@@ -85,6 +95,7 @@ python -m PyInstaller --onefile --noconsole ^
     --add-data "RELEASE.marker;." ^
     %ICON_REL% ^
     %ADD_ICON_REL% ^
+    %ADD_MOBNAMES% ^
     --name "MM Scribe" ^
     "%SCRIPT%"
 if errorlevel 1 goto :error

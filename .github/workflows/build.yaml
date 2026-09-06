@@ -131,7 +131,7 @@ jobs:
 
       # 只發布 Release 版(與 macOS 只包 .app 同理);Dev exe 留在 artifact 之外。
       # 圖表閱覽器 (MM Scribe Graph.exe) 沒有 Dev/Release 之分,直接收進來。
-      # zip 內附預設定檔,使用者解壓即有 skills.ini / settings.ini 可直接修改。
+      # zip 內附預設定檔,使用者解壓即有 skills.ini / settings.ini / effects.ini 可直接修改。
       # 原始碼檔名不再帶版號(見 RELEASING.md),所以版號讀 VERSION_STR。
       # 檔名格式對照 macOS zip:MMScribe.Beta.V0.52.Windows.zip
       - name: 壓縮 Release 版
@@ -157,7 +157,7 @@ jobs:
           }
 
           $NAME = "MMScribe.$($VER -replace ' ', '.').Windows.zip"
-          $items = @("MM Scribe.exe", "..\settings.ini", "..\skills.ini")
+          $items = @("MM Scribe.exe", "..\settings.ini", "..\skills.ini", "..\effects.ini")
           if (Test-Path "MM Scribe Graph.exe") {
             $items += "MM Scribe Graph.exe"
           } else {

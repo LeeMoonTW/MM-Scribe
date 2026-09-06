@@ -23,6 +23,7 @@ import math
 import os
 import sys
 import tkinter as tk
+import tkinter.font as tkfont   # buff 名稱塞不塞得進左側欄位要實際量
 import customtkinter as ctk
 
 # 版號的唯一來源是主程式的 VERSION_STR (見 RELEASING.md),這裡不自己維護一份。
@@ -64,6 +65,12 @@ TARGET_ALL = "__ALL__"
 TARGET_ALL_LABEL = "All"
 TARGET_BTN_SELECTED = "#3a6a9a"
 TARGET_BTN_IDLE = "#2a2a2a"
+# 按鈕寬度用「顯示單位」估算 (CJK 算 2 單位),不量實際字型 —— 量測值是螢幕
+# 像素,而 width= 吃的是 CTk 縮放後的單位,HiDPI 下會對不上。與主程式同一組值。
+TARGET_BTN_UNIT_W = 9              # 每單位估算寬度 (0x + 8 碼 = 10 單位 ≈ 舊的 96)
+TARGET_BTN_MIN_W = 60
+TARGET_BTN_MAX_W = 200
+TARGET_NAME_MAX_UNITS = 20         # 超過就截斷加省略號
 
 # ----------------------------------------------------
 # 配色
@@ -96,6 +103,28 @@ HOVER_LIGHTEN = 0.42        # hover 時色塊往白色推的比例
 TOOLTIP_MAX_SKILLS = 8      # tooltip 最多列幾個技能,其餘併成一行
 TOOLTIP_MAX_HITS = 15       # 按住 Shift 時最多列幾筆傷害明細,其餘只報筆數
 TOOLTIP_COL_GAP = 12        # 逐筆明細:傷害欄與後面欄位的間距 (px)
+# ---- Buff 持續軸 ----
+BUFF_ROW_H = 20            # 每列高度 (含間距)
+BUFF_BAR_H = 10            # 長條本身的高度
+BUFF_NAME_PT = 8           # 名稱字級
+BUFF_STACK_PT = 8          # 方塊開頭的層數標註字級
+BUFF_SEG_GAP = 2           # 相鄰方塊之間留的空隙 (px);不留的話連著的兩段會黏成一條
+BUFF_STACK_MIN_W = 18      # 方塊窄於這個寬度就不標層數 (字會溢出到隔壁)
+# 名稱欄:與傷害圖左側刻度同一個位置 (x0 - 6, 靠右),寬度就是 PAD_L 扣掉那 6px。
+# 塞不下的名字截斷加省略號 —— 不截的話會直接畫出 canvas 左緣,看起來像壞掉
+BUFF_NAME_GAP = 6
+BUFF_AXIS_PAD = 6
+# 長條綠色與主程式面板同一個色系。面板那邊是 #347747 (綠 #30A050 以 60% alpha
+# 疊在 #3A3A3A 上的預混結果);這裡底色更暗 (#1B1B1B),直接用未混色的原綠才不會糊掉。
+# 平常畫暗的那支,hover 傷害長條時把同時段的 buff 換成亮的 —— 兩者要一眼分得出來,
+# 又不能暗到看不見長條在哪
+COL_BUFF_BAR = "#1A582C"        # 平常
+COL_BUFF_BAR_HI = "#30A050"     # 被 hover 的時段
+# 層數文字要在暗綠與亮綠上都讀得到,所以用淺色 (原本的深色字在暗綠上會糊掉)
+COL_BUFF_STACK_TXT = "#e6f2ea"
+COL_BUFF_NAME = "#ffffff"
+COL_BUFF_BG = "#1b1b1b"
+
 COL_TIP_BG = "#101010"
 COL_TIP_BORDER = "#4a4a4a"
 COL_TIP_TXT = "#d8d8d8"
@@ -219,6 +248,44 @@ def format_skill_name(skill_id):
     return SKILL_NAMES.get(skill_id) or f"0x{skill_id:08X}"
 
 
+def display_units(text):
+    """估算顯示寬度單位:CJK / 全形算 2,其餘算 1。只拿來估按鈕寬度,不必精確。"""
+    return sum(2 if ord(ch) > 0x2E7F else 1 for ch in text)
+
+
+def clip_units(text, limit):
+    """依顯示單位截斷過長的名字,尾端補省略號。"""
+    if display_units(text) <= limit:
+        return text
+    out, used = [], 0
+    for ch in text:
+        w = 2 if ord(ch) > 0x2E7F else 1
+        if used + w > limit - 1:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + "…"
+
+
+def target_btn_width(text):
+    return min(TARGET_BTN_MAX_W,
+               max(TARGET_BTN_MIN_W, display_units(text) * TARGET_BTN_UNIT_W + 12))
+
+
+def format_target_name(tid, entity_names):
+    """目標按鈕文字:存檔有記到名字就用名字,否則退回 0x + 8 碼 hex。
+
+    序號是主程式存檔當下就定死的 (None = 當時全場只有這一隻),這裡不重算 ——
+    eid 換一次執行就換了,拿本檔的目標數量去推同名幾隻會推錯。
+    """
+    entry = entity_names.get(tid)
+    if entry is None:
+        return f"0x{tid:08X}"
+    name, ordinal = entry
+    label = clip_units(name, TARGET_NAME_MAX_UNITS)
+    return f"{label} #{ordinal}" if ordinal else label
+
+
 # ====================================================
 # 存檔讀取
 # ====================================================
@@ -249,10 +316,32 @@ def load_events(path):
                        None if sid is None else int(sid, 16),
                        int(dmg_val), int(flags)))
     events.sort(key=lambda e: e[0])
+    # Buff 持續軸:V0.5x 之前的存檔沒有這欄,缺了就當沒有 (圖表照畫,只是沒有下半段)
+    buffs = []
+    for row in (raw.get("buffs") or []):
+        try:
+            # 層數是後來才加的第 5 欄;更早的存檔只有 4 欄,當作 1 層
+            bid, nm, st, en = row[:4]
+            stacks = int(row[4]) if len(row) > 4 else 1
+            buffs.append((int(bid, 16), str(nm), float(st), float(en), stacks))
+        except (ValueError, TypeError, IndexError):
+            continue   # 壞掉的單列跳過就好,不值得為它讓整份存檔讀不進來
+    buffs.sort(key=lambda b: b[2])
+    # 目標名字:主程式 V0.5x 之後才存,缺了就當空的 (目標按鈕退回 hex)。
+    # 單列壞掉只跳過該列 —— 名字是顯示用的,不值得為它讓整份存檔讀不進來。
+    names = {}
+    for k, v in ((raw.get("damage") or {}).get("entity_names") or {}).items():
+        try:
+            names[int(k, 16)] = (str(v[0]),
+                                 None if v[1] is None else int(v[1]))
+        except (ValueError, TypeError, IndexError, KeyError):
+            continue
     return {
         "saved_at": raw.get("saved_at") or "?",
         "app_version": raw.get("app_version") or "?",
         "events": events,
+        "buffs": buffs,
+        "entity_names": names,
     }
 
 
@@ -448,7 +537,7 @@ class GraphViewer:
     def __init__(self, root):
         self.root = root
         self.root.title(f"MM Scribe Graph {VERSION_STR}")
-        self.root.geometry("1280x820")
+        self.root.geometry("1280x1000")
         self.root.minsize(900, 600)
         # 視窗標題列 icon:與主程式同一顆圖 (BuildTool 會把它一起打包進來)。
         # macOS 的 Tk 不吃 .ico,改用 iconphoto 讀 PNG;載不到不影響功能
@@ -479,10 +568,30 @@ class GraphViewer:
         self._geom = None        # 上次繪圖的座標資訊 (hover 命中判定用)
         self.selected_target = TARGET_ALL   # 目標過濾 (單選,與主程式一致)
         self.target_buttons = {}
+        self.entity_names = {}   # target_id → (怪物名, 序號或 None),來自存檔
         self.selected_skills = set()   # 圖表過濾:空集合 = 不過濾
         self.row_widgets = {}          # 技能名 → ([該列 widgets], 原底色)
         self.f_sec_total = None        # 套用過濾後的每秒總傷害
         self.f_cum = None              # 同上的前綴和 (兩條 DPS 線用)
+        self.buffs = []                # [(buffId, 名稱, 起, 迄)] 牆鐘秒
+        self.buff_rows = []            # 全部的列: [(名稱, [(起秒, 迄秒, 層數), ...])]
+        self.buff_stats = []           # 表格用: [(名稱, 覆蓋秒數, 覆蓋率)] 依覆蓋排序
+        # 持續軸要畫哪幾個 —— 預設空的 (什麼都不畫),由 BUFF 統計表點選加入。
+        # 用 list 不用 set:出現順序要照使用者點擊的順序
+        self.selected_buffs = []
+        self.buff_row_widgets = {}     # 名稱 → ([該列 widgets], 原底色)
+        # 持續軸上每個方塊的 (canvas item, 起秒, 迄秒) —— hover 傷害長條時
+        # 用來找出同時段生效中的 buff 並提亮
+        self._buff_seg_items = []
+        self._buff_hl_items = []       # 目前被提亮的那幾個,移開時要還原
+        self._buff_head = {}           # 欄名 → 表頭 label (點了要換 ▲▼)
+        # BUFF 表排序: (欄 index, 是否遞減)。預設名稱升冪 —— 名字的位置固定,
+        # 換了存檔也還在同一列,找起來比「覆蓋率排序」穩定
+        self._buff_sort = (0, False)
+        self._buff_name_font = None    # 量名稱寬度用,第一次要畫時才建
+        # 被截斷的名稱要能 hover 看全名: [(y上, y下, 全名), ...] 與名稱欄右界 x
+        self._buff_name_hits = []
+        self._buff_name_x = 0
 
         self.save_var = tk.StringVar(value=SAVE_COMBO_EMPTY)
         self.merge_var = tk.BooleanVar(value=False)
@@ -541,7 +650,15 @@ class GraphViewer:
             fg_color="transparent")
         self.target_bar.pack(fill="x", padx=8, pady=(4, 0))
         self.chart = tk.Canvas(chart_box, bg=BG_CHART, highlightthickness=0)
-        self.chart.pack(fill="both", expand=True, padx=8, pady=(4, 8))
+        self.chart.pack(fill="both", expand=True, padx=8, pady=(4, 0))
+        # Buff 持續軸:獨立 canvas,但左右內距與 chart 完全相同 (padx=8 + PAD_L/PAD_R),
+        # x 座標才會跟上面的傷害長條對得起來。縮放/橫移由 _draw_chart 末尾一併重畫
+        self.buffbar = tk.Canvas(chart_box, bg=COL_BUFF_BG, highlightthickness=0,
+                                  height=BUFF_ROW_H + BUFF_AXIS_PAD * 2)
+        self.buffbar.pack(fill="x", padx=8, pady=(0, 8))
+        # 名稱欄太窄,長一點的 buff 名會被截成「岩石巨人…」;滑上去顯示全名
+        self.buffbar.bind("<Motion>", self._on_buff_motion)
+        self.buffbar.bind("<Leave>", lambda _e: self.buffbar.delete("bufftip"))
         self.chart.bind("<Configure>", self._on_chart_resize)
         # 滾輪縮放:Windows / macOS 走 <MouseWheel> (delta 正負即方向),
         # X11 的滾輪是 Button-4/5,順手一起綁
@@ -564,9 +681,18 @@ class GraphViewer:
             self.root.bind(f"<KeyPress-{key}>", lambda _e: self._set_shift(True))
             self.root.bind(f"<KeyRelease-{key}>", lambda _e: self._set_shift(False))
 
+        # 技能統計 / BUFF 統計:共用一個 grid 容器。用 pack 的話兩塊會依各自的
+        # 需求高度分配剩餘空間 (技能列多就吃掉大半),grid + 相同 weight + uniform
+        # 才是真的對半分
+        tables_box = ctk.CTkFrame(self.root, fg_color="transparent")
+        tables_box.pack(fill="both", expand=True)
+        tables_box.grid_columnconfigure(0, weight=1)
+        for r in (0, 1):
+            tables_box.grid_rowconfigure(r, weight=1, uniform="stats")
+
         # 技能統計
-        table_box = ctk.CTkFrame(self.root, fg_color="#202020")
-        table_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        table_box = ctk.CTkFrame(tables_box, fg_color="#202020")
+        table_box.grid(row=0, column=0, sticky="nsew", padx=10, pady=(0, 10))
         thead = ctk.CTkFrame(table_box, fg_color="transparent")
         thead.pack(fill="x", padx=8, pady=(6, 2))
         ctk.CTkLabel(thead, text="技能統計", font=(FONT_UI, 13, "bold"),
@@ -584,6 +710,24 @@ class GraphViewer:
         self.filter_label.pack(side="right", padx=(0, 10))
         self.table = ctk.CTkScrollableFrame(table_box, fg_color="transparent")
         self.table.pack(fill="both", expand=True, padx=4, pady=(0, 6))
+
+        # BUFF 統計
+        buff_box = ctk.CTkFrame(tables_box, fg_color="#202020")
+        buff_box.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        bhead = ctk.CTkFrame(buff_box, fg_color="transparent")
+        bhead.pack(fill="x", padx=8, pady=(6, 2))
+        ctk.CTkLabel(bhead, text="BUFF統計", font=(FONT_UI, 13, "bold"),
+                     text_color="#5aa9e6").pack(side="left")
+        ctk.CTkLabel(bhead, text="(點BUFF列可在時間軸上顯示覆蓋圖表,可複選)",
+                     font=(FONT_UI, 11), text_color="#7a7a7a").pack(side="left",
+                                                                    padx=(8, 0))
+        self.clear_buff_btn = ctk.CTkButton(
+            bhead, text="清除過濾", width=80, font=(FONT_UI, 12),
+            fg_color="#3a3a3a", hover_color="#4a4a4a",
+            state="disabled", command=self.clear_buff_filter)
+        self.clear_buff_btn.pack(side="right")
+        self.buff_table = ctk.CTkScrollableFrame(buff_box, fg_color="transparent")
+        self.buff_table.pack(fill="both", expand=True, padx=4, pady=(0, 6))
 
     # ---------- 存檔 ----------
     def refresh_save_list(self):
@@ -611,13 +755,15 @@ class GraphViewer:
             return
         self.meta = data
         self.raw_events = data["events"]
+        self.buffs = data["buffs"]
+        self.entity_names = data["entity_names"]
         self.selected_target = TARGET_ALL
         self._build_target_bar()
         self._rebuild()
 
     def _build_target_bar(self):
         """依總傷害由大到小列出目標按鈕 (All 固定第一個)。
-        文字只放 Entity ID,與主程式、技能欄、開發者 log 的 0x + 8 碼慣例一致。
+        文字用存檔記下的怪物名,沒記到才退回 0x + 8 碼 hex (與主程式一致)。
         """
         for btn in self.target_buttons.values():
             btn.destroy()
@@ -636,7 +782,8 @@ class GraphViewer:
 
         add(TARGET_ALL, TARGET_ALL_LABEL, 46)
         for tid in sorted(totals, key=lambda t: -totals[t]):
-            add(tid, f"0x{tid:08X}", 96)
+            text = format_target_name(tid, self.entity_names)
+            add(tid, text, target_btn_width(text))
         self._update_target_style()
 
     def _update_target_style(self):
@@ -686,8 +833,180 @@ class GraphViewer:
             f"總傷害 {a.total:,}    "
             f"平均 DPS {a.total / a.duration:,.0f}    "
             f"傷害事件 {len(a.events):,} 筆")
+        # 覆蓋率的分母用「實際交手長度」而不是 base_n_sec —— 後者是每秒桶的個數
+        # (尾端會多算一秒),全程掛著的 buff 會算出 99% 這種看起來像有破口的數字
+        self._prepare_buff_rows(base_t0,
+                                self.raw_events[-1][0] - self.raw_events[0][0])
         self._build_table()
+        self._build_buff_table()
+        self.clear_buff_btn.configure(
+            state="normal" if self.selected_buffs else "disabled")
         self._apply_filter()   # 內含 _draw_chart
+
+    def _prepare_buff_rows(self, base_t0, base_span):
+        """把存檔裡的 buff 區間換算成「相對開場的秒數」並依名稱歸成列。
+
+        同名的多次施放共用一列 (參考圖的 BUFF1/2/3 就是這樣),列的排序看
+        總持續時間 —— 掛最久的排最上面,一眼看得出主要的增益覆蓋。
+        軸的原點與傷害圖共用 base_t0,兩張圖才對得起來。
+        """
+        # 區間一律夾進 [0, 場次長度]。主程式那邊已經把起點夾到「按下開始」,
+        # 但圖表的原點是**第一筆傷害**,不是按開始那一刻 —— 中間隔了多久就會多出
+        # 多少,不在這裡再夾一次仍會算出超過 100% 的覆蓋率
+        span = max(1.0, base_span)
+        by_name = {}
+        for _bid, nm, st, en, stacks in self.buffs:
+            st = min(max(st - base_t0, 0.0), span)
+            en = min(max(en - base_t0, 0.0), span)
+            if en <= st:
+                continue   # 整段都落在場次之外
+            by_name.setdefault(nm, []).append((st, en, stacks))
+        self.buff_rows = [(nm, sorted(segs)) for nm, segs in by_name.items()]
+        # 覆蓋秒數要先把區間**聯集**再算 —— 同名的不同實體 (例如兩個「情緒調節」)
+        # 可能時間重疊,直接把每段長度加總會算出超過 100% 的覆蓋率
+        stats = []
+        for nm, segs in self.buff_rows:
+            covered, cur_s, cur_e = 0.0, None, None
+            for st, en, _k in segs:
+                if cur_e is None or st > cur_e:
+                    if cur_e is not None:
+                        covered += cur_e - cur_s
+                    cur_s, cur_e = st, en
+                else:
+                    cur_e = max(cur_e, en)
+            if cur_e is not None:
+                covered += cur_e - cur_s
+            stats.append((nm, covered, covered * 100.0 / span))
+        self.buff_stats = stats
+        self._apply_buff_sort()
+        # 這份存檔裡已經沒有的名稱要從選取中丟掉,否則持續軸少一列卻還算在
+        # 「已選 N 個」裡
+        have = {nm for nm, _ in self.buff_rows}
+        self.selected_buffs = [n for n in self.selected_buffs if n in have]
+        self._sync_buffbar_height()
+
+    def _sync_buffbar_height(self):
+        """canvas 高度跟著「已選取的列數」走 —— 沒選就收成一條細線,不佔版面。"""
+        n = len(self.selected_buffs)
+        self.buffbar.configure(
+            height=(n * BUFF_ROW_H + BUFF_AXIS_PAD * 2) if n else 18)
+
+    def _fit_buff_name(self, name, avail):
+        """名稱塞不進左側欄位就從尾端截斷加省略號。
+
+        字寬要實際量 —— 中文/英文/數字混排時按字數估會差很多。
+        Font 物件建一次就快取,每列每次重畫都 new 一個會拖慢橫移。
+        """
+        f = self._buff_name_font
+        if f is None:
+            f = self._buff_name_font = tkfont.Font(
+                family=FONT_UI, size=BUFF_NAME_PT, weight="bold")
+        if avail <= 0 or f.measure(name) <= avail:
+            return name
+        for i in range(len(name) - 1, 0, -1):
+            clipped = name[:i] + "…"
+            if f.measure(clipped) <= avail:
+                return clipped
+        return "…"
+
+    def _draw_buffs(self, x0, plot_w, vs, g, n_slots):
+        """畫 buff 持續軸。座標換算與傷害圖同一套:
+        第 i 格的左緣是 x0 + i*slot_w,而 slot_w = plot_w / n_slots,
+        所以「時間 t 秒」對應到 x0 + (t - vs) / (n_slots * g) * plot_w。
+        """
+        c = self.buffbar
+        c.delete("all")
+        self._buff_name_hits = []
+        self._buff_seg_items = []
+        self._buff_hl_items = []
+        if self.agg is None:
+            return
+        # 沒有 buff 記錄 (舊版存檔) 一樣整片留白 —— 這件事在「BUFF統計」表裡
+        # 已經寫得很清楚了,時間軸這邊不重複
+        if not self.buff_rows:
+            return
+        # 依使用者點擊的順序取列 —— 不照覆蓋率排,照他自己排的
+        segs_of = dict(self.buff_rows)
+        rows = [(nm, segs_of[nm]) for nm in self.selected_buffs if nm in segs_of]
+        if not rows:
+            return   # 沒選就整片留白 (提示字放在 BUFF 統計的標題列,這裡不重複)
+        span = n_slots * g          # 可視區間的實際秒數 (併格後可能略大於 view_span)
+        if span <= 0 or plot_w <= 0:
+            return
+        # 只有被截斷的名稱才需要 hover 看全名,沒截斷的不記 —— 滑過完整的名字
+        # 還跳一個一模一樣的 tooltip 只是干擾
+        self._buff_name_x = x0
+
+        def t2x(t):
+            return x0 + (t - vs) / span * plot_w
+
+        for i, (nm, segs) in enumerate(rows):
+            y = BUFF_AXIS_PAD + i * BUFF_ROW_H + (BUFF_ROW_H - BUFF_BAR_H) / 2
+            # 底線:沒有長條的時段也看得出這一列存在,不然列與列會對不上名字
+            c.create_line(x0, y + BUFF_BAR_H / 2, x0 + plot_w,
+                          y + BUFF_BAR_H / 2, fill="#2a2a2a")
+            for st, en, stacks in segs:
+                # 可視範圍外的整段跳過;跨出邊界的裁掉超出的部分。
+                # en < st 是壞資料 (存檔時牆鐘被往回撥),跳過而不是畫成負寬度
+                if en < st or en < vs or st > vs + span:
+                    continue
+                bx0, bx1 = t2x(max(st, vs)), t2x(min(en, vs + span))
+                # 右緣讓出 BUFF_SEG_GAP —— 層數一變就切一段,相鄰兩段的時間是
+                # 連續的,不留空隙會黏成一條看不出切在哪
+                bx1 -= BUFF_SEG_GAP
+                # 極短的 buff 在縮小視野時會塌成 0 寬,補到至少 1px 才看得見
+                if bx1 - bx0 < 1:
+                    bx1 = bx0 + 1
+                self._buff_seg_items.append(
+                    (c.create_rectangle(bx0, y, bx1, y + BUFF_BAR_H,
+                                        fill=COL_BUFF_BAR, width=0), st, en))
+                # 層數標在方塊開頭。1 層不標 (與主程式面板同一個規則:大部分
+                # buff 一輩子都是 1 層,每塊都掛個 ×1 只是雜訊);
+                # 被視野左緣裁掉的那段也不標 —— 標在裁切點上會讓人以為那裡是起點
+                if stacks > 1 and st >= vs and bx1 - bx0 >= BUFF_STACK_MIN_W:
+                    c.create_text(bx0 + 2, y + BUFF_BAR_H / 2, text=f"×{stacks}",
+                                  anchor="w", fill=COL_BUFF_STACK_TXT,
+                                  font=(FONT_UI, BUFF_STACK_PT, "bold"))
+            # 名稱放左側欄位、靠右對齊 —— 與傷害圖的縱軸刻度 (x0 - 6, anchor="e")
+            # 同一個位置,兩張圖的左緣才連成一條線
+            shown = self._fit_buff_name(nm, x0 - BUFF_NAME_GAP)
+            c.create_text(x0 - BUFF_NAME_GAP, y + BUFF_BAR_H / 2, text=shown,
+                          anchor="e", fill=COL_BUFF_NAME,
+                          font=(FONT_UI, BUFF_NAME_PT, "bold"))
+            if shown != nm:
+                # 命中範圍取整列高,不是只有文字那幾 px —— 8pt 的字高不到 11px,
+                # 逼使用者精準壓在字上等於這功能不能用
+                row_top = BUFF_AXIS_PAD + i * BUFF_ROW_H
+                self._buff_name_hits.append((row_top, row_top + BUFF_ROW_H, nm))
+
+    def _on_buff_motion(self, e):
+        """滑過被截斷的 buff 名稱時,在旁邊顯示全名。"""
+        c = self.buffbar
+        c.delete("bufftip")
+        if e.x >= self._buff_name_x:      # 只有左側名稱欄有作用,長條區不理
+            return
+        for top, bottom, full in self._buff_name_hits:
+            if top <= e.y < bottom:
+                break
+        else:
+            return
+        f = self._buff_name_font
+        pad, tw = 5, (f.measure(full) if f else len(full) * 12)
+        th = BUFF_ROW_H
+        # 預設放在游標右下;貼到右緣就翻到左邊,貼到下緣就翻到上面 ——
+        # canvas 只有幾十 px 高,不翻的話 tooltip 會有一半在外面看不到
+        x = e.x + 12
+        if x + tw + pad * 2 > c.winfo_width():
+            x = max(0, e.x - 12 - tw - pad * 2)
+        y = e.y + 6
+        if y + th > c.winfo_height():
+            y = max(0, e.y - 6 - th)
+        c.create_rectangle(x, y, x + tw + pad * 2, y + th,
+                           fill=COL_TIP_BG, outline=COL_TIP_BORDER,
+                           tags="bufftip")
+        c.create_text(x + pad, y + th / 2, text=full, anchor="w",
+                      fill=COL_TIP_TXT, font=(FONT_UI, BUFF_NAME_PT),
+                      tags="bufftip")
 
     def _set_status(self, text, error=False):
         self.status.configure(text=text,
@@ -791,6 +1110,7 @@ class GraphViewer:
             self._clear_hover()
             for item, color in self._bar_items.get(slot, ()):
                 self.chart.itemconfigure(item, fill=lighten(color))
+            self._highlight_buffs(slot)
             self._hover_slot = slot
         # 位置要記在 _clear_hover 之後 —— 那支會把它歸零,先寫會被洗掉,
         # Shift 原地切換模式就會失效
@@ -798,6 +1118,23 @@ class GraphViewer:
         # tooltip 要跟著游標走,所以每次移動都重畫 (只有幾個 item,很便宜)
         self.chart.delete("tooltip")
         self._draw_tooltip(slot, e.x, e.y)
+
+    def _highlight_buffs(self, slot):
+        """把「這一格的時間範圍內生效中」的 buff 方塊換成亮色。
+
+        只作用在持續軸上真的畫出來的方塊 —— 沒被選進時間軸的 buff 本來就沒有
+        item,自然不會被提亮。
+        併格時 (g > 1) 一格代表好幾秒,只要方塊與這段時間有交集就算生效。
+        """
+        gm = self._geom
+        if gm is None or not self._buff_seg_items:
+            return
+        lo = gm["vs"] + slot * gm["g"]
+        hi = lo + gm["g"]
+        for item, st, en in self._buff_seg_items:
+            if st < hi and en > lo:
+                self.buffbar.itemconfigure(item, fill=COL_BUFF_BAR_HI)
+                self._buff_hl_items.append(item)
 
     def _set_shift(self, on):
         """Shift 狀態改變 → 若正 hover 著,原地把 tooltip 換成另一種模式。"""
@@ -814,6 +1151,10 @@ class GraphViewer:
             for item, color in self._bar_items.get(self._hover_slot, ()):
                 self.chart.itemconfigure(item, fill=color)
             self._hover_slot = None
+        # 提亮的 buff 方塊一併還原。整張重畫時 item 已失效,_draw_buffs 會清空這份
+        for item in self._buff_hl_items:
+            self.buffbar.itemconfigure(item, fill=COL_BUFF_BAR)
+        self._buff_hl_items = []
         self._hover_xy = None
         self.chart.delete("tooltip")
 
@@ -934,6 +1275,7 @@ class GraphViewer:
         if self.agg is None:
             c.create_text(W // 2, H // 2, text="讀取存檔後在此顯示傷害時間軸",
                           fill="#666666", font=(FONT_UI, 13))
+            self.buffbar.delete("all")
             return
 
         a = self.agg
@@ -1088,6 +1430,8 @@ class GraphViewer:
                       "y_bottom": y_bottom, "slot_w": slot_w,
                       "n_slots": n_slots, "g": g, "vs": vs,
                       "slot_total": slot_total, "slot_skill": slot_skill}
+        # Buff 軸跟著同一組座標重畫 —— 縮放、橫移、resize 都會走到這裡
+        self._draw_buffs(x0, plot_w, vs, g, n_slots)
 
     # ---------- 技能統計表 ----------
     # (欄名, 寬度, 對齊)  —— 欄位與參考圖一致,數值語意與主程式相同
@@ -1147,6 +1491,110 @@ class GraphViewer:
                 w.bind("<Button-1>", lambda _e, n=name: self._toggle_skill(n))
             self.row_widgets[name] = (widgets, bg)
         self._restyle_rows()
+
+    # (欄名, 寬度, 對齊) —— BUFF 統計只有三欄,名稱那欄伸縮
+    # 寬度與對齊沿用技能表的第一欄 (COLUMNS[0]),兩張表的名稱欄才等寬
+    BUFF_COLUMNS = (("BUFF名稱", COLUMNS[0][1], "w"), ("覆蓋率", 90, "e"),
+                    ("生效時間", 110, "e"))
+
+    def _build_buff_table(self):
+        for w in self.buff_table.winfo_children():
+            w.destroy()
+        self.buff_row_widgets = {}
+        if not self.buff_stats:
+            ctk.CTkLabel(self.buff_table, text="此存檔沒有 BUFF 記錄",
+                         font=(FONT_UI, 12), text_color="#7a7a7a",
+                         anchor="w").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+            return
+        # 第 0 欄留白,寬度與技能表的顏色標記欄相同 —— 沒有它的話兩張表的
+        # 名稱雖然等寬,起點還是會差 18px,看起來仍舊沒對齊
+        self.buff_table.grid_columnconfigure(0, minsize=18)
+        for i, (_n, wd, _a) in enumerate(self.BUFF_COLUMNS):
+            self.buff_table.grid_columnconfigure(i + 1, minsize=wd,
+                                                 weight=1 if i == 0 else 0)
+        # 尾端補一根固定寬度的空欄,讓兩張表的「非伸縮欄總寬」相等。
+        # 名稱欄是唯一 weight=1 的欄,會把剩餘空間全吃下去 —— BUFF 表只有三欄,
+        # 不補的話它拿到的剩餘空間遠多於技能表,實際寬度就差了三倍
+        # (實測 1400px 視窗下:技能名 345px vs BUFF 名 1003px)
+        pad = (sum(w for _n, w, _a in self.COLUMNS[1:])
+               - sum(w for _n, w, _a in self.BUFF_COLUMNS[1:]))
+        self.buff_table.grid_columnconfigure(len(self.BUFF_COLUMNS) + 1,
+                                             minsize=max(0, pad), weight=0)
+        sort_col, sort_desc = self._buff_sort
+        for i, (name, _wd, anchor) in enumerate(self.BUFF_COLUMNS):
+            head = name + (" ▼" if sort_desc else " ▲") if i == sort_col else name
+            self._buff_head[name] = lbl = ctk.CTkLabel(
+                self.buff_table, text=head, font=(FONT_UI, 12, "bold"),
+                text_color="#ffffff" if i == sort_col else "#bfbfbf",
+                anchor=anchor, cursor="hand2")
+            lbl.grid(row=0, column=i + 1, sticky="ew", padx=4, pady=(2, 4))
+            lbl.bind("<Button-1>", lambda _e, k=i: self._sort_buff_table(k))
+        for r, (nm, secs, pct) in enumerate(self.buff_stats, start=1):
+            bg = COL_ROW_ALT if r % 2 else "transparent"
+            cells = (nm, f"{pct:.1f}%", fmt_mmss(secs))
+            widgets = []
+            for i, ((_n, _wd, anchor), text) in enumerate(zip(self.BUFF_COLUMNS, cells)):
+                lbl = ctk.CTkLabel(self.buff_table, text=text, font=(FONT_UI, 12),
+                                   anchor=anchor, fg_color=bg, cursor="hand2",
+                                   text_color="#e0e0e0" if i == 0 else "#c8c8c8")
+                lbl.grid(row=r, column=i + 1, sticky="nsew", padx=4, pady=1)
+                # 整列都可點 (同技能表:只綁名稱那格的話點右半邊沒反應會像壞掉)
+                lbl.bind("<Button-1>", lambda _e, n=nm: self._toggle_buff(n))
+                widgets.append(lbl)
+            self.buff_row_widgets[nm] = (widgets, bg)
+        self._restyle_buff_rows()
+
+    # 各欄的排序鍵。名稱用字串,其餘用數值 —— 全部丟給 sorted 的 key
+    _BUFF_SORT_KEYS = (lambda r: r[0], lambda r: r[1], lambda r: r[1])
+
+    def _sort_buff_table(self, col):
+        """點表頭切換排序。同一欄再點一次換升冪/降冪。
+
+        「覆蓋率」與「生效時間」是同一個量的兩種寫法 (覆蓋秒數 ÷ 場長),
+        排序鍵共用一個,不必分開。
+        """
+        cur_col, desc = self._buff_sort
+        self._buff_sort = (col, not desc if col == cur_col else (col != 0))
+        self._apply_buff_sort()
+        self._build_buff_table()
+
+    def _apply_buff_sort(self):
+        col, desc = self._buff_sort
+        self.buff_stats.sort(key=self._BUFF_SORT_KEYS[col], reverse=desc)
+
+    def _toggle_buff(self, name):
+        """點一下加入持續軸,再點一下移除。**加在尾端** —— 持續軸的列序就是
+        使用者點選的順序,不重排。"""
+        if name in self.selected_buffs:
+            self.selected_buffs.remove(name)
+        else:
+            self.selected_buffs.append(name)
+        self._apply_buff_filter()
+
+    def clear_buff_filter(self):
+        if not self.selected_buffs:
+            return
+        self.selected_buffs.clear()
+        self._apply_buff_filter()
+
+    def _apply_buff_filter(self):
+        self._restyle_buff_rows()
+        n = len(self.selected_buffs)
+        self.clear_buff_btn.configure(state="normal" if n else "disabled")
+        # 高度變了要先讓 Tk 套用,_draw_buffs 才量得到新的 winfo_height
+        self._sync_buffbar_height()
+        self.root.update_idletasks()
+        self._draw_chart()
+
+    def _restyle_buff_rows(self):
+        """選取中的列改底色 + 名稱轉白,並在名稱前標上它在持續軸的第幾列。"""
+        for nm, (widgets, bg) in self.buff_row_widgets.items():
+            on = nm in self.selected_buffs
+            for i, w in enumerate(widgets):
+                w.configure(fg_color=COL_ROW_SEL if on else bg)
+            widgets[0].configure(
+                text=f"{self.selected_buffs.index(nm) + 1}. {nm}" if on else nm,
+                text_color="#ffffff" if on else "#e0e0e0")
 
     def _fmt_rate(self, name, tag):
         v = self.agg.rate(name, tag)

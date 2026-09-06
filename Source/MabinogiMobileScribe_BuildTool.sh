@@ -72,7 +72,7 @@ echo "Icon for Release : ${ICON_REL[*]:-none - using default}"
 # macOS 的 .app 內部不可寫,程式會在首次啟動時把這些複製到
 # ~/Library/Application Support/MM Scribe/ 供使用者編輯。
 CONFIGS=()
-for cfg in skills.ini settings.ini; do
+for cfg in skills.ini settings.ini effects.ini; do
     [[ -f "$cfg" ]] && CONFIGS+=("--add-data=$cfg:.")
 done
 
@@ -82,7 +82,17 @@ if [[ -f ../macos-bpf-access.sh ]]; then
     CONFIGS+=("--add-data=../macos-bpf-access.sh:.")
 fi
 
+# 怪物名對照表:目標欄位要靠它把 entityId 顯示成怪物名,少了只會退回 hex,
+# 所以找不到不算失敗。只給主程式 —— 圖表閱覽器的名字是從存檔讀的,不必吃這 200KB。
+MOBNAMES=()
+if [[ -f ../Note/Ref/notice_monster_names_tw.json ]]; then
+    MOBNAMES=(--add-data=../Note/Ref/notice_monster_names_tw.json:.)
+else
+    echo "[WARN] 找不到 ../Note/Ref/notice_monster_names_tw.json — 目標欄位只會顯示 hex"
+fi
+
 echo "Bundled configs  : ${CONFIGS[*]:-none}"
+echo "Monster names    : ${MOBNAMES[*]:-none}"
 echo
 
 # ---- Clean previous build artifacts so PyInstaller does not reuse cached spec ----
@@ -93,7 +103,7 @@ echo " Step 1/4 : Build DEV version (with developer options)"
 echo "============================================================"
 "$PY" -m PyInstaller --windowed --noconfirm \
     --collect-data customtkinter \
-    "${ICON_DEV[@]}" "${ADD_ICON_DEV[@]}" "${CONFIGS[@]}" \
+    "${ICON_DEV[@]}" "${ADD_ICON_DEV[@]}" "${CONFIGS[@]}" "${MOBNAMES[@]}" \
     --name "MM Scribe Dev" \
     "$SCRIPT"
 
@@ -111,7 +121,7 @@ echo "============================================================"
 "$PY" -m PyInstaller --windowed --noconfirm \
     --collect-data customtkinter \
     --add-data "RELEASE.marker:." \
-    "${ICON_REL[@]}" "${ADD_ICON_REL[@]}" "${CONFIGS[@]}" \
+    "${ICON_REL[@]}" "${ADD_ICON_REL[@]}" "${CONFIGS[@]}" "${MOBNAMES[@]}" \
     --name "MM Scribe" \
     "$SCRIPT"
 

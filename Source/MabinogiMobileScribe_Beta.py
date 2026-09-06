@@ -6,17 +6,20 @@
 支援 Windows 10/11 與 macOS (Apple Silicon / Intel)。
 macOS 上遊戲為 iOS App on Mac,流量直接走實體網卡,抓法與 Windows 端相同。
 
-打包說明:
+打包說明 (實務上直接跑 MabinogiMobileScribe_BuildTool.bat / .sh,以下是等價的手動指令):
+  怪物名對照表也要打包 —— 少了它目標欄位只能顯示 entityId 的 hex。
+  (Windows 這裡也寫成斜線:PyInstaller 兩種都吃,而反斜線在本 docstring 裡會變成跳脫序列)
+
   Windows 開發版 (顯示開發者選項):
-    python -m PyInstaller --onefile --noconsole --collect-data customtkinter MabinogiMobileScribe_Beta.py
+    python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "../Note/Ref/notice_monster_names_tw.json;." MabinogiMobileScribe_Beta.py
 
   Windows 發布版 (隱藏開發者選項):
     type nul > RELEASE.marker
-    python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." MabinogiMobileScribe_Beta.py
+    python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." --add-data "../Note/Ref/notice_monster_names_tw.json;." MabinogiMobileScribe_Beta.py
 
   macOS (--add-data 分隔符是 ':' 不是 ';'):
     touch RELEASE.marker
-    python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." MabinogiMobileScribe_Beta.py
+    python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." --add-data "../Note/Ref/notice_monster_names_tw.json:." MabinogiMobileScribe_Beta.py
 
   程式啟動時會偵測執行檔內是否包含 RELEASE.marker 檔案,
   存在則隱藏開發者選項按鈕(釋出給他人使用)。
@@ -87,7 +90,7 @@ def is_release_build():
 # ----------------------------------------------------
 # 設定
 # ----------------------------------------------------
-VERSION_STR = "Beta V0.60"
+VERSION_STR = "Beta V0.65"
 COVERAGE_MIN_HITS = 10  # 覆蓋率計算所需最少樣本數
 # 需要統計覆蓋率的標籤 (上方面板、技能排行展開明細共用同一份;順序即顯示順序)
 COVERAGE_TAGS = ("爆擊", "強擊", "連擊", "追擊")
@@ -123,6 +126,8 @@ DMG_EVENT_SUSTAIN_BIT = 1 << 17
 # 時間序列保留筆數上限 (deque,超量自動丟最舊的)
 DMG_EVENT_MAX = 100000
 SKILL_CFG_NAME = "skills.ini"
+EFFECT_CFG_NAME = "effects.ini"   # buffId → 效果名 (見 load_effect_names)
+EFFECT_IGNORE_SECTION = "ignore"  # 這個區段列的 buffId 不顯示在面板上 (比對時轉小寫)
 SETTINGS_CFG_NAME = "settings.ini"
 # 代理模式偵測用的遊戲執行檔名 (小寫比對)。可由 settings.ini 的 [Network] 覆寫
 DEFAULT_GAME_PROCESSES = ("mabinogimobile.exe",)
@@ -270,6 +275,53 @@ MOB_HEAD_SENTINEL = b"\x03\x00\x00\x00"   # 前哨
 MOB_TAIL_SENTINEL = b"\x00\x00\x00\x00"   # 後哨
 # 掃到這三個一律當沒掃到,繼續往前找 (對照表裡確認過沒有這三個鍵)
 MOB_CODE_IGNORE = {"00000000", "01000000", "FFFFFFFF"}
+# ---- Buff 探針 (0x1ADE8 / 0x1ADEA / 0x1ADE9) — 開發者 LOG 觀測用,不進統計 ----
+# 見 Note/MM_Scribe_PacketNotes_Buff.md。四份離線樣本 (Note/Ref/Buff pcapng) 推導,
+# ADD/REM 的語意已由「宣告 8.0 秒 → 實際存活 8.01 秒」驗證。
+#
+#   ADD/UPD content (36B): [8B 擁有者 eid][8B buffKey][u32 buffId][f32 秒數]
+#                          [u32 層數][8B 來源 eid]
+#   REM   content (16B): [8B 擁有者 eid][8B buffKey]
+#
+# 這三個 opcode 的 content 都是 enc=0 (未壓縮),不需要 brotli、也不必接續跨封包的
+# body —— 整則訊息只有 25/45 bytes,直接逐 payload 掃 magic 就好,不必像 _mob_walk
+# 那樣維護串流狀態。假標頭靠「opcode + 長度完全相符 + enc==0」三重守門擋掉。
+# opcode 是「今天台版的值」,會隨改版變動 (與 0x51E9 / 0x4E4C 同樣風險)。
+BUFF_ADD_TYPE = 0x1ADE8           # REPLICATION_ActorBuff_Add_REPL
+BUFF_UPD_TYPE = 0x1ADEA           # 更新 (同 key/buffId/秒數,只有 c 欄變)
+BUFF_REM_TYPE = 0x1ADE9           # 移除 / 到期
+# {packetType: (magic, content 長度, 顯示名)} — 長度必須完全相符才採信
+BUFF_OPS = {
+    BUFF_ADD_TYPE: (struct.pack("<I", BUFF_ADD_TYPE), 36, "ADD"),
+    BUFF_UPD_TYPE: (struct.pack("<I", BUFF_UPD_TYPE), 36, "UPD"),
+    BUFF_REM_TYPE: (struct.pack("<I", BUFF_REM_TYPE), 16, "REM"),
+}
+# 無限持續的判定:**不能比對特定值**。實測拿到 0xD1B03913 與 0xD1B03914 兩個,
+# 解成 float32 是 -94608973824.0 / -94608982016.0 —— 都是「約 -3000 年」,
+# 差一個 ULP = 8192 秒 ≈ 2.3 小時。這欄放的是絕對時間值,底層時鐘一直在走,
+# 只是 float32 在這個量級每 8192 秒才跳一格,短時間內錄的樣本才會全都一樣
+# (初版就是這樣誤判成固定哨兵,隔幾天撞到 0x...14 就顯示成未知值)。
+# 改成:解得出合理秒數就是有限,否則 (負值 / 0 / NaN / 超大值) 一律當無限。
+BUFF_DUR_MAX = 1e7                # 合理秒數上限 (約 115 天)。真實 buff 遠短於此,
+                                  # 「無限」那個值是 9.46e10,兩者差 4 個數量級
+BUFF_LOG_MAX = 5000               # 詳細行總量上限,超過只留累計數字
+# ---- 即時 Buff 監測面板 ----
+BUFF_TICK_MS = 200                # 倒數重繪間隔。100ms 以下只是白燒 CPU,肉眼看不出差別
+# 進度條填充色:綠 #30A050 以 60% alpha 疊在 canvas 深灰底 (#3A3A3A) 上,
+# 算法與技能列的橘色同一套 (見 _create_skill_row):
+#   R = 0.6*0x30 + 0.4*0x3A = 0x34   G = 0.6*0xA0 + 0.4*0x3A = 0x77
+#   B = 0.6*0x50 + 0.4*0x3A = 0x47
+BUFF_FILL_COLOR = "#347747"
+BUFF_INFINITE_TEXT = "∞"          # 無限持續的 buff 沒有秒數可倒數,進度條固定滿格
+PANE_CONTENT_MIN_H = 90           # 攻擊日誌 / 技能排行 / Buff 三個 pane 內容區的
+                                  # 最小高度。均分靠 grid uniform,而 uniform 會把所有
+                                  # row 拉到「需求最高」的那個,所以三者必須給同一個值,
+                                  # 否則會互相頂高、把視窗撐爆
+BUFF_SCROLL_H = PANE_CONTENT_MIN_H
+BUFF_HISTORY_MAX = 4000           # 存檔用的已結束區間上限 (與 damage_events 同性質)
+BUFF_ACTIVE_MAX = 512             # 同時追蹤幾筆 buff。換場景時舊實體不會送 REM,
+                                  # 沒有上限就是純漏水(自己的 buff 只有個位數,
+                                  # 額度幾乎都花在場上其他實體身上)
 DISCORD_INVITE_URL = "https://discord.gg/NaddqvBVvb"
 # 日誌欄位布局: \t [傷害值 (右對齊)] \t [標籤 (左對齊)] \t [技能名稱 (可往右溢出)]
 # 行首那個 tab 是必要的 — Tk 的 right tab stop 對齊的是「tab 之後到下一個 tab」的字,
@@ -341,7 +393,8 @@ def get_save_dir():
 def load_monster_names():
     """讀怪物碼 → 名字對照表 (5,743 筆,鍵是 8 字元大寫 hex)。
 
-    只有開發者模式的怪物探針用得到,讀不到就整個功能靜默關閉。
+    目標按鈕要靠它把 entityId 顯示成怪物名,所以發布版也要載入。
+    讀不到就整個功能靜默關閉 (目標欄位退回 hex),不影響任何統計。
     原始碼佈局下檔案還放在 Note/Ref/,所以多找一層。
     """
     tried = set()
@@ -363,8 +416,9 @@ def load_monster_names():
     return {}
 
 
-# 發布版沒有診斷 LOG 的 UI 入口,不必花時間 parse 200KB JSON
-MONSTER_NAMES = {} if RELEASE_BUILD else load_monster_names()
+# 發布版一樣要載入 — 目標按鈕的名字來源就是它。啟動時 parse 200KB JSON
+# 約數十毫秒,換掉「目標欄位只有一串 hex」值得。
+MONSTER_NAMES = load_monster_names()
 
 
 def load_skill_config():
@@ -455,6 +509,61 @@ def load_skill_config():
 # 每次按下「開始」都會重新讀取 (見 start_monitoring)
 # 開程式時預先載一次,方便主程式建立初始狀態
 SKILL_NAMES, MERGE_GROUPS, _, _ = load_skill_config()
+
+
+def load_effect_names():
+    """從 EXE 同資料夾下的 effects.ini 讀取 buffId → 效果名。
+
+        [效果]
+        0x0053830E = 傷害增加
+        0x006B1FFF = 生命贈禮
+
+    與 skills.ini 分開:buffId 和 skill_id 是**不同命名空間**,合在一起會互撞
+    (見 Note/MM_Scribe_PacketNotes_Buff.md §3)。區段名不限,全部區段一起收。
+
+    另有一個 [Ignore] 區段列出「不要顯示在面板上」的 buffId (假人、測量用的
+    內部效果之類)。該區段只看 key,寫成 `0x1234ABCD` 或 `0x1234ABCD = 名稱`
+    都可以 —— 有名稱時一併收進對照表,診斷 LOG 才看得懂是哪一個。
+
+    回傳 (names, ignore, errors)。檔案不存在回傳空 dict —— 沒有對照表只是退回
+    顯示 hex,不該讓程式起不來。
+    """
+    path = get_external_path(EFFECT_CFG_NAME)
+    if not os.path.exists(path):
+        return {}, set(), []
+    errors = []
+    # interpolation=None 是必要的:效果名裡有「移動速度+7%」這種百分比,
+    # configparser 預設會把 % 當插值語法,在 items() 時丟 InterpolationSyntaxError
+    # (而且是 read() 之後才炸,包在 read 的 try 裡攔不到)
+    # allow_no_value=True 是必要的:[Ignore] 區段只寫 buffId、沒有 `= 值`,
+    # 預設會在 read() 就丟 ParsingError,整份三千多筆一起解不出來
+    parser = configparser.ConfigParser(interpolation=None, allow_no_value=True)
+    parser.optionxform = str          # 保留原大小寫,0x1ADE8 不要被轉小寫
+    names, ignore = {}, set()
+    try:
+        parser.read(path, encoding="utf-8")
+        for section in parser.sections():
+            is_ignore = section.strip().lower() == EFFECT_IGNORE_SECTION
+            for key, value in parser.items(section):
+                try:
+                    buff_id = int(key.strip(), 16)
+                except ValueError:
+                    errors.append(f"[{section}] '{key}' 不是有效的十六進位 buffId,已略過")
+                    continue
+                if is_ignore:
+                    ignore.add(buff_id)
+                # value 在 allow_no_value 下可能是 None
+                name = (value or "").strip()
+                if name:
+                    names[buff_id] = name
+    except Exception as e:
+        # 這份是唯讀對照表、使用者一般不會手改,不必像 skills.ini 那樣逐類報錯。
+        # 已解出來的部分照樣回傳 —— 壞在最後一行不該讓前面三千筆全丟掉
+        errors.append(f"{EFFECT_CFG_NAME} 解析失敗:{type(e).__name__}: {e}")
+    return names, ignore, errors
+
+
+EFFECT_NAMES, EFFECT_IGNORE, _ = load_effect_names()
 
 
 def load_settings():
@@ -574,6 +683,16 @@ def format_skill_name(skill_id):
     if skill_id == 0:
         return "疑似符文傷害"
     return SKILL_NAMES.get(skill_id) or f"0x{skill_id:08X}"
+
+
+def format_buff_name(buff_id):
+    """把 buffId 轉為顯示名稱。
+
+    只查 effects.ini —— buffId 與 skill_id 是不同命名空間,查 SKILL_NAMES 只會
+    撞出無關的技能名 (見 Note/MM_Scribe_PacketNotes_Buff.md §3)。
+    查不到就退回 hex,方便使用者自己補進 effects.ini。
+    """
+    return EFFECT_NAMES.get(buff_id) or f"Buff 0x{buff_id:08X}"
 
 
 def list_bpf_devices():
@@ -865,18 +984,22 @@ class LiveDamageMonitor:
         ctk.set_window_scaling(self.font_scale)
 
         self.root.title(f"MM Scribe {VERSION_STR}")
-        # 初始高度 780;每個 popout 中的 pane 從初值扣 200,啟動就用正確高度,
+        # 初始高度 900 (三個資訊 pane 均分後各約 180px,一開就看得到內容);
+        # 每個 popout 中的 pane 從初值扣 200,啟動就用正確高度,
         # 不能在 __init__ 尾端做 delta 調整 — 那時 winfo_height() 因視窗尚未 realize
         # 回傳 1,dcalc 後會被 clamp 到 200 → 主視窗變超小、看不到開始按鈕
         # 340 是「dmg_banner + 3 條控制列 + status_bar + padding」的合理下限,
         # 保證兩個都 popout 時也看得到計時器那排
-        initial_h = 780
+        initial_h = 900
         if self.settings.get("popout_log", False):
             initial_h -= 200
         if self.settings.get("popout_skill", False):
             initial_h -= 200
         initial_h = max(340, initial_h)
-        self.root.geometry(f"500x{initial_h}")
+        self._initial_geometry = f"500x{initial_h}"
+        self.root.geometry(self._initial_geometry)
+        # 這一發多半會被夾掉 (原因見 _apply_initial_geometry),真正生效的是
+        # __init__ 尾端排的那輪重試。
 
         # 設定視窗標題列 icon (優先用 dev icon,找不到再退回一般 icon)
         # macOS 的 Tk 不吃 .ico,改用 iconphoto 讀 PNG;打包成 .app 後
@@ -918,6 +1041,8 @@ class LiveDamageMonitor:
         self._ident_reset()
         # 怪物登場包探針狀態 (見 _mob_reset / _mob_scan) — 與身分偵測完全分離
         self._mob_reset()
+        # Buff 狀態 (見 _buff_reset / _buff_scan)
+        self._buff_reset()
         # 攔截執行緒世代編號:換網卡時 +1,舊執行緒下一個封包就自行退出
         self._sniff_gen = 0
 
@@ -932,6 +1057,10 @@ class LiveDamageMonitor:
         self.selected_target = TARGET_ALL
         self.target_buttons = {}      # key (TARGET_ALL 或 target_id) → CTkButton
         self._target_sort_after_id = None   # 目標排序輪詢的 after id
+        # 讀存檔帶進來的目標名字 {target_id → (名字, 序號或 None)}。與 _entity_names
+        # 分開放:那是本次執行實際收到的登場包,存檔的是別次執行 (甚至別人) 的 eid,
+        # 混在一起會讓序號的意義變得不可信。
+        self._loaded_names = {}
 
         # 攻擊事件緩衝:切換目標時要重畫日誌,所以每筆都要留下結構化紀錄。
         # deque(maxlen) 超量會自動丟最舊的,不必手動修剪。
@@ -1000,6 +1129,7 @@ class LiveDamageMonitor:
         self._prev_height = None
         self.skill_collapsed = False
         self.merge_var = tk.BooleanVar(value=False)
+        self.buff_collapsed = False
 
         # 治癒統計 (heal_total = heal_self + heal_ally,累加自 0x5029 事件)
         self.heal_total = 0
@@ -1251,8 +1381,11 @@ class LiveDamageMonitor:
         #    抽成 _build_*_pane(parent) 方法,dock/popout 兩情境共用建立邏輯
         #    起始時 parent = root,若 popout_* 為 True,__init__ 尾端會 pop 出去
         # ----------------------------------------------------
-        self._build_log_pane(root)
-        self._build_skill_pane(root)
+        # 三個資訊 pane 統一裝進 pane_container,高度由 _layout_panes 以 grid 均分
+        self.pane_container = ctk.CTkFrame(root, fg_color="transparent")
+        self._build_log_pane(self.pane_container)
+        self._build_skill_pane(self.pane_container)
+        self._build_buff_pane(self.pane_container)
 
         # ----------------------------------------------------
         # 5.6 治癒事件日誌 (可折疊,packing 交給 _apply_tracking_mode)
@@ -1356,6 +1489,10 @@ class LiveDamageMonitor:
         # 每 3 秒依累積傷害重排目標按鈕列
         self._tick_target_sort()
 
+        # Buff 倒數重繪的常駐 timer。與「開始/停止」無關 —— buff 是狀態,
+        # 沒在收 ADD 就永遠等不到,倒數也不該因為按了停止就停在原地
+        self._buff_tick()
+
         # 依 track_damage / track_heal 旗標,把 banner + pane 一次性 pack 到位
         self._apply_tracking_mode()
 
@@ -1367,6 +1504,25 @@ class LiveDamageMonitor:
         # macOS 會先確認有沒有 BPF 權限 — 沒有的話掃描每張網卡都只會失敗,
         # 不如先把權限問題解決掉再掃。
         self.root.after(500, self._start_capture_access_flow)
+
+        # 視窗高度要等 CTk 解開它自己的 min/max 鎖才套得上去 (見下方說明)
+        self.root.after(200, self._apply_initial_geometry)
+
+    def _apply_initial_geometry(self, tries=6):
+        """把 __init__ 設的初始 geometry 補套上去,套不上就每 250ms 再試,最多 6 次。
+
+        為什麼要重試:ctk.set_window_scaling() 會把 wm_minsize/wm_maxsize 暫時鎖在
+        「CTk 預設視窗大小」(600x500),1 秒後才由它自己的 after 解開。這段期間送出的
+        geometry 會被 WM 夾掉,接著 _refresh_minsize 又把視窗撐到 minsize —— 結果
+        不管 initial_h 設多少,啟動高度永遠等於 minsize (實測固定 565)。
+        只在「目前比預期矮」時才補,使用者若已自己拉大視窗就不會被縮回去。
+        """
+        want_h = int(self._initial_geometry.split("x")[1])
+        if self.root.winfo_height() >= int(want_h * self.font_scale) - 2:
+            return
+        self.root.geometry(self._initial_geometry)
+        if tries > 0:
+            self.root.after(250, lambda: self._apply_initial_geometry(tries - 1))
 
     # ================================================
     # 事件處理
@@ -1418,7 +1574,8 @@ class LiveDamageMonitor:
         # wrap="none":單筆過長就往右凸出去,不折行。CTkTextbox 的水平捲軸會在
         # 需要時自動出現 (它每 200ms 檢查 xview),不必自己管。
         self.log_area = ctk.CTkTextbox(self.log_pane, wrap="none",
-                                        font=(FONT_LOG, 13), corner_radius=0)
+                                        font=(FONT_LOG, 13), corner_radius=0,
+                                        height=PANE_CONTENT_MIN_H)
         # 折疊狀態下不 pack log_area,由 toggle_log_collapse 處理
         if not self.log_collapsed:
             self.log_area.pack(fill="both", expand=True, padx=6, pady=6)
@@ -1459,7 +1616,8 @@ class LiveDamageMonitor:
         ).pack(side="right", padx=(6, 4))
         self.skill_scroll = ctk.CTkScrollableFrame(self.skill_pane,
                                                      corner_radius=0,
-                                                     fg_color="#242424")
+                                                     fg_color="#242424",
+                                                     height=PANE_CONTENT_MIN_H)
         if not self.skill_collapsed:
             self.skill_scroll.pack(fill="both", expand=True, padx=6, pady=6)
         self.skill_pane.bind("<Enter>", self._skill_area_enter)
@@ -1468,6 +1626,81 @@ class LiveDamageMonitor:
         # skill_damage 重建列
         self.skill_rows = {}
         return self.skill_pane
+
+    def _build_buff_pane(self, parent):
+        """建立「即時 Buff 監測」pane。結構與技能傷害排行同一套(可折疊 + 捲動區),
+        差別是列不能展開、進度條是綠色、內容由 _buff_tick 自行倒數。
+        """
+        self.buff_pane = ctk.CTkFrame(parent, corner_radius=0)
+        buff_header = ctk.CTkFrame(self.buff_pane, fg_color="transparent")
+        buff_header.pack(fill="x", padx=6, pady=(6, 0))
+        self.btn_buff_toggle = ctk.CTkButton(
+            buff_header,
+            text=("▶ 即時Buff監測 (已折疊)" if self.buff_collapsed
+                  else "▼ 即時Buff監測"),
+            font=(FONT_UI, 11),
+            fg_color="transparent",
+            hover_color="#2a2a2a",
+            anchor="w",
+            corner_radius=6,
+            height=26,
+            command=self.toggle_buff_collapse,
+        )
+        self.btn_buff_toggle.pack(side="left", fill="x", expand=True)
+        self.buff_scroll = ctk.CTkScrollableFrame(self.buff_pane,
+                                                   corner_radius=0,
+                                                   fg_color="#242424",
+                                                   height=BUFF_SCROLL_H)
+        if not self.buff_collapsed:
+            self.buff_scroll.pack(fill="both", expand=True, padx=6, pady=6)
+        self.buff_rows = {}
+        return self.buff_pane
+
+    def toggle_buff_collapse(self):
+        """折疊/展開即時 Buff 監測。折疊時 buff_scroll 隱藏但 active_buffs 持續更新。"""
+        if self.buff_collapsed:
+            self.buff_scroll.pack(fill="both", expand=True, padx=6, pady=6)
+            self.btn_buff_toggle.configure(text="▼ 即時Buff監測")
+            self.buff_collapsed = False
+        else:
+            self.buff_scroll.pack_forget()
+            self.btn_buff_toggle.configure(text="▶ 即時Buff監測 (已折疊)")
+            self.buff_collapsed = True
+        self._layout_panes()
+
+    # 三個資訊 pane 共用的 grid uniform 群組名。同群組 + 相同 weight 的 row,
+    # Tk grid 保證高度完全相等 —— 這就是「均分」的實作
+    _PANE_UNIFORM = "ldm_info_pane"
+
+    def _layout_panes(self):
+        """把攻擊日誌 / 技能排行 / Buff 三個 pane 以 grid 排進 pane_container。
+
+        - 未折疊:weight=1 + uniform 群組 → 彼此高度相等;只剩一個展開時它吃滿
+        - 已折疊:weight=0 → 只佔標題列高度,所以三個標題永遠看得到
+        - popout 出去的 pane 不在 container 內,自然不參與均分
+        全部折疊時把 container 改成 expand=False,免得底下留一塊空白。
+        """
+        container = self.pane_container
+        panes = []
+        if not self.popout_log:
+            panes.append((self.log_pane, self.log_collapsed))
+        if not self.popout_skill:
+            panes.append((self.skill_pane, self.skill_collapsed))
+        panes.append((self.buff_pane, self.buff_collapsed))
+
+        container.grid_columnconfigure(0, weight=1)
+        for row in range(3):
+            container.grid_rowconfigure(row, weight=0, uniform="")
+        any_expanded = False
+        for row, (pane, collapsed) in enumerate(panes):
+            pane.grid(row=row, column=0, sticky="nsew", pady=(0, 3))
+            if not collapsed:
+                container.grid_rowconfigure(row, weight=1,
+                                            uniform=self._PANE_UNIFORM)
+                any_expanded = True
+        if container.winfo_manager() == "pack":
+            container.pack_configure(expand=any_expanded,
+                                     fill="both" if any_expanded else "x")
 
     # ================================================
     # Popout / dock:攻擊日誌 & 技能排行的獨立視窗切換
@@ -1503,7 +1736,7 @@ class LiveDamageMonitor:
             except Exception:
                 pass
             self._log_popout_win = None
-        self._build_log_pane(self.root)
+        self._build_log_pane(self.pane_container)
         self._render_log()
 
     def _popout_skill(self):
@@ -1536,7 +1769,7 @@ class LiveDamageMonitor:
             except Exception:
                 pass
             self._skill_popout_win = None
-        self._build_skill_pane(self.root)
+        self._build_skill_pane(self.pane_container)
         self.update_skill_ranking()
 
     def _build_dev_pane(self, parent):
@@ -1673,8 +1906,8 @@ class LiveDamageMonitor:
         """依 self.track_damage / self.track_heal 重新佈局所有可切換的 banner / pane。
         - status_bar 位於視窗最上方 (side=top),不可被壓縮
         - Banner (dmg_banner, heal_banner) 用 `before=ctrl_row1` 插入到控制列上方
-        - 中段 pane (log_pane, skill_pane, heal_log_pane) 全部 forget 後
-          按順序 pack 於末端 (list 尾端 = 視覺上位於控制列下方)
+        - 三個資訊 pane (log/skill/buff) 一律裝在 pane_container 內,由
+          _layout_panes 均分高度;這裡只決定 container 與 heal_log_pane 的 pack
         - 底部診斷區塊不在此處理:它 side="bottom" 常駐,不隨追蹤模式變動
         """
         # === Banners ===
@@ -1692,20 +1925,15 @@ class LiveDamageMonitor:
         # popout 中的 pane 已 pack 在自己的 Toplevel,主視窗這邊要跳過 (不能對它
         # 呼叫 pack_forget,因為 Toplevel 的 pack 不是 root 管的)
         self.target_row.pack_forget()
-        if not self.popout_log:
-            self.log_pane.pack_forget()
-        if not self.popout_skill:
-            self.skill_pane.pack_forget()
+        self.pane_container.pack_forget()
         self.heal_log_pane.pack_forget()
 
         if self.track_damage:
             # 目標篩選同時作用於看板/技能排行/日誌,只要有追蹤傷害就顯示,
             # 不受 popout_log 影響
             self.target_row.pack(fill="x", padx=10, pady=(0, 3))
-            if not self.popout_log:
-                self.log_pane.pack(fill="both", expand=True, padx=10, pady=(3, 3))
-            if not self.popout_skill:
-                self.skill_pane.pack(fill="both", expand=True, padx=10, pady=(0, 3))
+            self.pane_container.pack(fill="both", expand=True, padx=10, pady=(3, 0))
+            self._layout_panes()
         if self.track_heal:
             self.heal_log_pane.pack(fill="both", expand=True, padx=10, pady=(0, 3))
         # 底部診斷區塊不參與這裡的重排 (side="bottom",__init__ 內一次 pack 到底)
@@ -1731,6 +1959,13 @@ class LiveDamageMonitor:
         if self.track_damage:
             parts.append(self.dmg_banner)
             parts.append(self.target_row)
+            # 三個資訊 pane 都會伸縮,最小高度只算它們的標題列 —— 標題必須永遠
+            # 看得到 (內容區的最小高度由下面那 80px slack 涵蓋)
+            if not self.popout_log:
+                parts.append(self.btn_log_toggle)
+            if not self.popout_skill:
+                parts.append(self.btn_skill_toggle)
+            parts.append(self.btn_buff_toggle)
         if self.track_heal:
             parts.append(self.heal_banner)
         req_h = sum(w.winfo_reqheight() for w in parts)
@@ -2721,48 +2956,29 @@ class LiveDamageMonitor:
 
     def toggle_log_collapse(self):
         """折疊/展開事件日誌。折疊時 log_area 隱藏但仍持續寫入。
-        折疊時該視窗高度縮到剛好容納其餘元件;展開時還原上次記住的高度。
-
-        target = log_pane 當前所在的 Toplevel (dock 時是 root、popout 時是 Toplevel),
-        所有 geometry 都對它操作,避免主視窗被 popout 視窗的動作影響。
-        prev height 用 attribute 存在 target 上,讓每個 Toplevel 各自記憶。
+        高度重分配交給 _layout_panes (未折疊的 pane 均分),不再動視窗 geometry。
         """
-        scale = self.font_scale
-        target = self.log_pane.winfo_toplevel()
         if self.log_collapsed:
-            # === 展開 ===
             self.log_area.pack(fill="both", expand=True, padx=6, pady=6)
-            self.log_pane.pack_configure(expand=True, fill="both")
             self.btn_log_toggle.configure(text="▼ 即時攻擊事件日誌")
             self.log_collapsed = False
-            prev = getattr(target, "_ldm_log_prev_h", None)
-            if prev:
-                w = target.winfo_width()
-                target.geometry(f"{int(w / scale)}x{int(prev / scale)}")
         else:
-            # === 折疊 ===
-            target._ldm_log_prev_h = target.winfo_height()  # 記住當前高度
             self.log_area.pack_forget()
-            self.log_pane.pack_configure(expand=False, fill="x")
             self.btn_log_toggle.configure(text="▶ 即時攻擊事件日誌 (已折疊)")
             self.log_collapsed = True
-            target.update_idletasks()
-            w = target.winfo_width()
-            h = target.winfo_reqheight()
-            target.geometry(f"{int(w / scale)}x{int(h / scale)}")
+        self._layout_panes()
 
     def toggle_skill_collapse(self):
         """折疊/展開技能傷害排行區塊。折疊時 skill_scroll 隱藏但 target_stats 持續累計。"""
         if self.skill_collapsed:
             self.skill_scroll.pack(fill="both", expand=True, padx=6, pady=6)
-            self.skill_pane.pack_configure(expand=True, fill="both")
             self.btn_skill_toggle.configure(text="▼ 技能傷害排行")
             self.skill_collapsed = False
         else:
             self.skill_scroll.pack_forget()
-            self.skill_pane.pack_configure(expand=False, fill="x")
             self.btn_skill_toggle.configure(text="▶ 技能傷害排行 (已折疊)")
             self.skill_collapsed = True
+        self._layout_panes()
 
     def _skill_area_enter(self, event):
         """滑鼠進入技能排行區,暫時接管 wheel 事件並禁止 CTk 內建 handler 打架。"""
@@ -2889,7 +3105,8 @@ class LiveDamageMonitor:
         Canvas 只需 itemconfigure 觸發重繪即可 (以確保新尺寸生效)。
         """
         canvas_h, name_font, value_font = self._skill_row_metrics()
-        for row in self.skill_rows.values():
+        # buff 列與技能列用同一組 metrics,一起重算
+        for row in list(self.skill_rows.values()) + list(self.buff_rows.values()):
             c = row["canvas"]
             c.configure(height=canvas_h)
             row["canvas_h"] = canvas_h
@@ -2901,6 +3118,107 @@ class LiveDamageMonitor:
             w = c.winfo_width()
             c.coords(row["value_id"], w - 10, canvas_h // 2)
             c.coords(row["fill_id"], 0, 0, int(w * row["pct"]), canvas_h)
+
+    def _create_buff_row(self, key):
+        """建立單一 buff 的顯示列。結構與 _create_skill_row 相同但更精簡:
+        沒有展開的詳細統計、填充色改綠色、右側文字是剩餘秒數。
+        """
+        container = ctk.CTkFrame(self.buff_scroll, fg_color="transparent")
+        container.pack(fill="x", padx=0, pady=1)
+
+        canvas_h, name_font, value_font = self._skill_row_metrics()
+        bar = tk.Canvas(container, height=canvas_h, bg="#3a3a3a",
+                         highlightthickness=0, bd=0)
+        bar.pack(fill="x")
+
+        fill_id = bar.create_rectangle(0, 0, 0, canvas_h,
+                                        fill=BUFF_FILL_COLOR, outline="")
+        name_id = bar.create_text(10, canvas_h // 2, text="", anchor="w",
+                                   font=name_font, fill="#ffffff")
+        value_id = bar.create_text(0, canvas_h // 2, text="", anchor="e",
+                                    font=value_font, fill="#ffffff")
+
+        row = {
+            "container": container, "canvas": bar,
+            "fill_id": fill_id, "name_id": name_id, "value_id": value_id,
+            "canvas_h": canvas_h,
+            "pct": 1.0,   # 進度條預設滿格,倒數時才往下掉
+        }
+
+        def _on_configure(event, r=row):
+            w = event.width
+            r["canvas"].coords(r["fill_id"], 0, 0, int(w * r["pct"]), r["canvas_h"])
+            r["canvas"].coords(r["value_id"], w - 10, r["canvas_h"] // 2)
+        bar.bind("<Configure>", _on_configure)
+        return row
+
+    def _buff_tick(self):
+        """每 BUFF_TICK_MS 重畫一次 buff 列。
+
+        倒數完全靠本地時鐘 (time.monotonic),不等伺服器 —— 封包只給「開始那一刻
+        的總秒數」,中間不會再送。倒數到 0 時**保持在 0 不清除**:到期是由 REM
+        封包宣告的,自行清掉會在漏包時讓畫面與遊戲不符。
+        """
+        try:
+            self.update_buff_list()
+        except Exception:
+            pass
+        finally:
+            # 一律排下一次 —— 這是常駐 timer,不隨開始/停止或折疊中斷
+            self._buff_tick_id = self.root.after(BUFF_TICK_MS, self._buff_tick)
+
+    def update_buff_list(self):
+        """重建/更新 buff 列。只顯示掛在自己身上的 buff。
+
+        面板有三種狀態 —— 快取 (active_buffs) 一直在背景累積,這裡只決定顯示什麼:
+          1. 還沒按過開始 → 一列都不顯示 (快取照收,按開始就會一次列出來)
+          2. 監控中       → 依快取即時顯示,倒數走真實時鐘
+          3. 已按停止     → 顯示按停止那一刻的快照,秒數定格
+
+        Resize 進行中跳過視覺更新(與 update_skill_ranking 同一套規則);
+        折疊時仍照跑,列是隱藏不是銷毀,展開後不必等下一個封包才有畫面。
+        """
+        if self._is_resizing:
+            return
+        if self._buff_frozen_at is not None:
+            source, now = (self._buff_frozen_view or {}), self._buff_frozen_at
+        elif self.is_monitoring:
+            source, now = self.active_buffs, time.monotonic()
+        else:
+            source, now = {}, 0.0
+        me = self.ident_self_entity
+        # 還沒認出自己就一列都不顯示 —— 沒有身分就無從判斷 buff 是不是自己的
+        live = {} if me is None else {
+            k: v for k, v in source.items() if v["owner"] == me}
+
+        for key, info in live.items():
+            if key not in self.buff_rows:
+                self.buff_rows[key] = self._create_buff_row(key)
+            row = self.buff_rows[key]
+            if info["infinite"]:
+                pct, value_txt = 1.0, BUFF_INFINITE_TEXT
+            else:
+                remain = max(0.0, info["end"] - now)
+                pct = (remain / info["dur"]) if info["dur"] > 0 else 0.0
+                value_txt = f"{remain:.1f}s"
+            row["pct"] = pct
+            # 層數接在名稱後面。1 層不標 —— 大部分 buff 一輩子都是 1 層,
+            # 每列都掛個 ×1 只是雜訊
+            stacks = info["stacks"]
+            name_txt = info["name"] if stacks <= 1 else f"{info['name']}  ×{stacks}"
+            c = row["canvas"]
+            c.itemconfigure(row["name_id"], text=name_txt)
+            c.itemconfigure(row["value_id"], text=value_txt)
+            w = c.winfo_width()
+            # Canvas 剛建立時 winfo_width 可能為 1,交給 Configure 事件補畫
+            if w > 1:
+                c.coords(row["fill_id"], 0, 0, int(w * pct), row["canvas_h"])
+
+        # 收到 REM (或換角色/換場景導致 owner 不再是自己) 的列直接銷毀
+        for key in list(self.buff_rows.keys()):
+            if key not in live:
+                self.buff_rows[key]["container"].destroy()
+                del self.buff_rows[key]
 
     def update_skill_ranking(self):
         """把「目前選取目標」的 skill_damage (raw by skill_id) 聚合後重排技能列。
@@ -3085,8 +3403,8 @@ class LiveDamageMonitor:
         if MONSTER_NAMES:
             self.dev_log(f"[MOB] 怪物名對照表已載入 {len(MONSTER_NAMES):,} 筆 — "
                          f"0x{MOB_APPEAR_TYPE:04X} 登場包探針啟用 (純觀測,不進統計)")
-        elif not RELEASE_BUILD:
-            self.dev_log(f"[MOB] 找不到 {MOB_NAME_FILE},怪物名探針關閉")
+        else:
+            self.dev_log(f"[MOB] 找不到 {MOB_NAME_FILE},目標欄位只能顯示 hex")
 
     # ================================================
     # 攻擊事件日誌
@@ -3262,12 +3580,17 @@ class LiveDamageMonitor:
         """
         if key == TARGET_ALL:
             return TARGET_ALL_LABEL
-        entry = self._entity_names.get(key)
+        entry = self._entity_names.get(key) or self._loaded_names.get(key)
         if entry is None:
             return f"0x{key:08X}"
         name, ordinal = entry
         label = clip_units(name, TARGET_NAME_MAX_UNITS)
-        return label if self._name_count[name] <= 1 else f"{label} #{ordinal}"
+        # 本次執行收到的:序號隨「目前看過幾隻同名的」浮動,只有一隻就不掛 #1。
+        # 存檔帶來的:序號是存檔當下就定死的 (None = 當時只有一隻),不能拿
+        # 現在的 _name_count 重算 —— 那是另一次執行的計數。
+        if key in self._entity_names:
+            ordinal = ordinal if self._name_count[name] > 1 else None
+        return f"{label} #{ordinal}" if ordinal else label
 
     def _refresh_target_labels(self):
         """只更新既有按鈕的文字/寬度,不重建 widget。
@@ -3988,6 +4311,190 @@ class LiveDamageMonitor:
                 return code
         return None
 
+    # ------------------------------------------------------------------
+    # Buff 探針 (0x1ADE8 / 0x1ADEA / 0x1ADE9) — 純觀測,只寫診斷 LOG
+    #   _buff_reset   清狀態 (每次重建視窗)
+    #   _buff_scan    每個封包的入口,任何例外都不得影響其他解析
+    # 佈局與驗證過程見 Note/MM_Scribe_PacketNotes_Buff.md
+    # ------------------------------------------------------------------
+    def _buff_reset(self):
+        """清空 buff 狀態。與身分偵測 / 怪物探針完全分開。"""
+        # 面板資料:(owner, buffKey hex) → {owner, buff_id, name, dur, end, infinite}
+        # **key 一定要含 owner** —— buffKey 不是全域唯一的,實測同一個 key
+        # 會同時掛在三隻怪身上(見 Note/MM_Scribe_PacketNotes_Buff.md),
+        # 只用 key 當索引會互相覆蓋、REM 一隻就把另一隻的也刪掉。
+        # 只有 REM 封包會刪 —— 倒數到 0 不清除,見 _buff_tick
+        self.active_buffs = collections.OrderedDict()
+        self._buff_tick_id = None
+        # 停止後的凍結快照。按停止時記下當下的 monotonic 與當時的列,面板就定格在
+        # 那一瞬間;按開始時兩者清回 None 恢復走動。
+        # **凍結的是畫面,不是 active_buffs** —— 快取一直在背景更新 (見 _buff_scan),
+        # 所以按開始時直接就有正確的剩餘秒數,不必等下一個封包。
+        # (也不是把 tick 停掉 —— tick 還要負責 resize / 折疊後的重繪)
+        self._buff_frozen_at = None
+        self._buff_frozen_view = None
+        # 存檔用的「已結束」區間:(buffId, 名稱, 起, 迄, 層數),時間是 time.time() 牆鐘 ——
+        # 要和 damage_events 對得起來就必須同一個時鐘 (倒數另外用 monotonic,
+        # 那是為了不受系統時間調整影響)。REM 時才寫進來,還在身上的那些
+        # 由 _buff_intervals() 於存檔當下補上
+        self.buff_history = collections.deque(maxlen=BUFF_HISTORY_MAX)
+        # 按下「開始」的牆鐘時刻。存檔時所有 buff 區間的起點都夾到這裡 ——
+        # 開始前就掛在身上的持久型 buff (例如無限持續的) 起點可能是幾十分鐘前,
+        # 不夾的話覆蓋率會算出超過 100%
+        self._monitor_start_wall = None
+        # (op, 擁有者 eid, buffKey) → 已印過。ADD 會重送,不去重會洗版
+        self._buff_seen = collections.OrderedDict()
+        self._buff_lines = 0       # 已印的詳細行數 (上限 BUFF_LOG_MAX)
+
+    def _buff_log(self, msg):
+        self.root.after(0, lambda m=msg: self.dev_log(m))
+
+    def _buff_note(self, msg):
+        """詳細行有上限 — 一場下來 buff 事件不少,不設限會把其他診斷洗掉。
+
+        面板不受這裡影響:_buff_scan 一律跑,只有診斷輸出看開發者模式
+        (檢查在 _buff_report 內,見那裡的註解)。
+        """
+        self._buff_lines += 1
+        if self._buff_lines <= BUFF_LOG_MAX:
+            self._buff_log(msg)
+        elif self._buff_lines == BUFF_LOG_MAX + 1:
+            self._buff_log(f"[BUFF] 詳細行已達 {BUFF_LOG_MAX} 行上限,之後不再輸出")
+
+    @staticmethod
+    def _buff_parse_duration(raw):
+        """持續時間欄位 → (是否無限, 秒數)。判定規則見 BUFF_DUR_MAX 的註解。"""
+        secs = struct.unpack("<f", struct.pack("<I", raw))[0]
+        # NaN 兩邊比較都是 False,會落到「無限」那一支,不必另外判
+        if 0 < secs < BUFF_DUR_MAX:
+            return False, secs
+        return True, 0.0
+
+    @classmethod
+    def _buff_duration_text(cls, raw):
+        """診斷 LOG 用的時長文字。無限的情況把 raw 一併印出來 ——
+        這欄會漂移,原始值留著才看得出表示法有沒有再變。
+        """
+        infinite, secs = cls._buff_parse_duration(raw)
+        return f"無限({raw:08X})" if infinite else f"{secs:g}s"
+
+    def _buff_first_seen(self, seen_key):
+        """去重:同一則事件會重送,只有第一次回報 True。"""
+        if seen_key in self._buff_seen:
+            return False
+        self._buff_seen[seen_key] = True
+        while len(self._buff_seen) > MOB_SEEN_MAX:
+            self._buff_seen.popitem(last=False)
+        return True
+
+    def _buff_scan(self, payload):
+        """探針入口 — 任何例外都不得影響其他解析。"""
+        try:
+            self._buff_walk(payload)
+        except Exception:
+            pass
+
+    def _buff_walk(self, payload):
+        """逐 payload 掃三個 buff opcode 的 9-byte 標頭。
+
+        整則訊息只有 25/45 bytes,不做跨封包接續:被 TCP 切中的那幾則就是漏掉,
+        與傷害事件同樣的已知代價 (見 PacketNotes_Damage §2「已知漏包來源」)。
+        守門是三重的 —— opcode 相符、contentLength 與該 opcode 的固定長度**完全**
+        相等、encodingType == 0;三個都對還撞上的機率低到可以忽略。
+        """
+        n = len(payload)
+        hits = []
+        for magic, clen, name in BUFF_OPS.values():
+            pos = 0
+            while True:
+                off = payload.find(magic, pos)
+                if off < 0 or off + 9 + clen > n:
+                    break
+                pos = off + 1
+                if struct.unpack_from("<I", payload, off + 4)[0] != clen:
+                    continue
+                if payload[off + 8] != 0:
+                    continue
+                hits.append((off, name, payload[off + 9:off + 9 + clen]))
+        # 三種 opcode 分開找,但要照線序印 —— 同一個封包裡 ADD 與 UPD 的先後
+        # 就是層數變化的順序,依 opcode 分組會把它洗掉
+        hits.sort(key=lambda h: h[0])
+        for _off, name, body in hits:
+            self._buff_report(name, body)
+
+    def _buff_report(self, name, body):
+        # 擁有者 / 來源取 u64 的低 32 位 — 與傷害事件的 attacker/target 同一套實體 ID,
+        # 這樣才能直接套 _target_label 顯示怪物名
+        owner = struct.unpack_from("<I", body, 0)[0]
+        key = body[8:16].hex().upper()
+        if name == "REM":
+            # 面板:收到 REM 直接清掉(去重只管診斷輸出,資料一定要刪)
+            gone = self.active_buffs.pop((owner, key), None)
+            if gone is not None and owner == self.ident_self_entity:
+                # 只記自己身上的 —— 圖表畫的是「我的 buff 軸」,場上幾十隻怪的
+                # debuff 進來只會把 history 灌爆
+                self.buff_history.append(
+                    (gone["buff_id"], gone["name"], gone["start_wall"],
+                     time.time(), gone["stacks"]))
+            if not self.is_dev_mode:
+                return
+            if not self._buff_first_seen((name, owner, key)):
+                return
+            self._buff_note(f"[BUFF] REM 對象:{self._target_label(owner)} key={key}")
+            return
+        buff_id, dur_raw, stacks = struct.unpack_from("<III", body, 16)
+        src = struct.unpack_from("<I", body, 28)[0]
+        # 面板:ADD 與 UPD 都當成「重新開始倒數」——
+        # 封包只在事件當下給一次總秒數,中間不會再送,所以每次收到就重設 end。
+        infinite, dur = self._buff_parse_duration(dur_raw)
+        # effects.ini 的 [Ignore] 清單:不進面板。診斷 LOG 仍會印(標上「已忽略」)——
+        # 那是開發者模式限定的,留著才查得出「某個 buff 為什麼沒出現」
+        # effects.ini 的 [Ignore] 清單:不進面板。診斷 LOG 仍會印(標上「已忽略」)——
+        # 那是開發者模式限定的,留著才查得出「某個 buff 為什麼沒出現在面板上」
+        ignored = buff_id in EFFECT_IGNORE
+        # 先 pop 再 set:OrderedDict 的汰換順序要跟著「最後一次更新」走,
+        # 直接指派不會把既有的 key 移到尾端。被忽略的只 pop 不 set —— 使用者
+        # 中途把某個 buffId 加進 [Ignore] 並按重新開始時,面板上那筆要消失
+        prev = self.active_buffs.pop((owner, key), None)
+        if not ignored:
+            wall = time.time()
+            # 層數變了就把前一段收掉、從這一刻重新起算 —— 圖表要能把
+            # 「10 層那段」與「32 層那段」畫成兩塊。純粹的重送 (層數沒變)
+            # 不切,否則同一個層級會被切成一堆碎塊
+            if prev is not None and prev["stacks"] != stacks                     and owner == self.ident_self_entity:
+                self.buff_history.append(
+                    (prev["buff_id"], prev["name"], prev["start_wall"],
+                     wall, prev["stacks"]))
+            self.active_buffs[(owner, key)] = {
+                "owner": owner,
+                "buff_id": buff_id,
+                "name": format_buff_name(buff_id),
+                "dur": dur,
+                "end": time.monotonic() + dur,
+                "infinite": infinite,
+                "stacks": stacks,
+                # 牆鐘起訖,只給存檔/圖表用。start_wall 是「目前這個層級」的起點:
+                # 層數沒變就沿用 (重送不切段),變了就從現在重新起算 (見上面)
+                "start_wall": (wall if prev is None or prev["stacks"] != stacks
+                               else prev["start_wall"]),
+                "end_wall": None if infinite else wall + dur,
+            }
+            while len(self.active_buffs) > BUFF_ACTIVE_MAX:
+                self.active_buffs.popitem(last=False)
+        # 以下只為診斷 LOG。f-string 的參數在呼叫前就求值,_buff_note 內部的
+        # 開發者模式檢查擋不掉 _target_label 的開銷,所以在這裡就先擋掉
+        if not self.is_dev_mode:
+            return
+        # 去重鍵含層數 —— 同一個 key 的重送要擋掉,但層數變化必須印出來
+        if not self._buff_first_seen((name, owner, key, stacks)):
+            return
+        self._buff_note(
+            f"[BUFF] {name}{'(已忽略)' if ignored else ''} "
+            f"對象:{self._target_label(owner)} "
+            f"buffId=0x{buff_id:08X}({format_buff_name(buff_id)}) "
+            f"時長={self._buff_duration_text(dur_raw)} "
+            f"層數={stacks} 來源:{self._target_label(src)} key={key}")
+
     def parse_payload(self, payload):
         offset = 0
         payload_len = len(payload)
@@ -4492,9 +4999,17 @@ class LiveDamageMonitor:
         ip_layer, tcp_layer = packet[IP], packet[TCP]
         conn_key = (ip_layer.src, tcp_layer.sport, ip_layer.dst, tcp_layer.dport)
         self._scan_identity(raw_payload, conn_key)
-        # 怪物登場包探針:純觀測,只在開發版且對照表讀得到時才跑
-        if self.is_dev_mode and MONSTER_NAMES:
+        # 怪物登場包探針:目標按鈕的名字來源,發布版一樣要跑 (診斷 LOG 只有開發版看得到)。
+        # 不受「開始/停止」影響 — 登場包只在進視野那一刻送,錯過就沒有名字了。
+        if MONSTER_NAMES:
             self._mob_scan(raw_payload, conn_key)
+        # Buff:一律掃進快取,不受「開始/停止」影響 —— ADD 一輩子只送一次,
+        # 沒在收就永遠等不到 (同身分偵測的理由)。「按開始前不顯示」是
+        # update_buff_list 那邊的事,不是這裡。
+        # end 存的是絕對時間,所以按開始時剩餘秒數自然是對的:10 秒前拿到的
+        # 30 秒 buff,按下去就顯示 20 秒。
+        # 診斷 LOG 那一份輸出才看開發者模式,見 _buff_note
+        self._buff_scan(raw_payload)
         if not self.is_monitoring:
             return
         if self.track_damage:
@@ -4564,6 +5079,23 @@ class LiveDamageMonitor:
             self.log(f"=== 已載入 {group_count} 個合併群組,涵蓋 {len(MERGE_GROUPS)} 個技能名稱 ===")
         for member, first, ignored in conflicts:
             self.log(f"⚠ 群組衝突:「{member}」已屬於「{first}」,忽略「{ignored}」的宣告")
+        # effects.ini 同樣每次按開始重讀,讓使用者補了 buffId 不用重啟
+        global EFFECT_NAMES, EFFECT_IGNORE
+        EFFECT_NAMES, EFFECT_IGNORE, effect_errors = load_effect_names()
+        for err in effect_errors:
+            self.log_error(f"    • {err}")
+        if EFFECT_NAMES:
+            self.log(f"=== 已載入 {len(EFFECT_NAMES)} 個效果名稱 ({EFFECT_CFG_NAME})"
+                     f",忽略清單 {len(EFFECT_IGNORE)} 筆 ===")
+        else:
+            self.log(f"=== 未載入 {EFFECT_CFG_NAME},Buff 欄將顯示 hex ID ===")
+        # 解除凍結 → 面板改吃背景快取,把「按下去這一刻身上有的 buff」一次列出來。
+        # 不清快取:清了就要等每個 buff 重新 ADD 才會再出現,而 ADD 一輩子只送一次
+        self._buff_frozen_at = None
+        self._buff_frozen_view = None
+        # 存檔時的區間起點下界 (見 _buff_intervals)
+        self._monitor_start_wall = time.time()
+
         # 已顯示中的技能排行列即時套用新名稱
         self.update_skill_ranking()
 
@@ -4666,6 +5198,10 @@ class LiveDamageMonitor:
         if self.timer_end_time is not None:
             self._cancel_timer()
             self.log("=== 計時已隨監控停止取消 ===")
+        # 停止 → 面板定格成此刻的快照。逐筆 dict(v) 是必要的:快取在背景還會繼續
+        # 更新層數/秒數,共用同一個 dict 的話凍結畫面會被偷偷改掉
+        self._buff_frozen_at = time.monotonic()
+        self._buff_frozen_view = {k: dict(v) for k, v in self.active_buffs.items()}
         self.log("=== 已停止監控 ===")
 
     # ================================================
@@ -4689,6 +5225,37 @@ class LiveDamageMonitor:
     @staticmethod
     def _dec_target_key(key):
         return key if key == TARGET_ALL else int(key, 16)
+
+    def _enc_entity_names(self):
+        """有桶且認得出名字的目標 → {"0x........": [名字, 序號或 null]}。"""
+        out = {}
+        for key in self.target_stats:
+            if key == TARGET_ALL:
+                continue
+            entry = self._entity_names.get(key) or self._loaded_names.get(key)
+            if entry is None:
+                continue
+            name, ordinal = entry
+            if key in self._entity_names and self._name_count[name] <= 1:
+                ordinal = None
+            out[f"0x{key:08X}"] = [name, ordinal]
+        return out
+
+    @staticmethod
+    def _dec_entity_names(raw):
+        """存檔的 entity_names → {target_id(int) → (名字, 序號或 None)}。
+        舊存檔沒有這欄,缺了就當空的 (目標欄位退回 hex);單列壞掉只跳過該列 ——
+        名字是顯示用的,不值得為它讓整份存檔讀不進來。
+        """
+        out = {}
+        for k, v in (raw or {}).items():
+            try:
+                name, ordinal = v[0], v[1]
+                out[int(k, 16)] = (str(name),
+                                   None if ordinal is None else int(ordinal))
+            except (ValueError, TypeError, IndexError, KeyError):
+                continue
+        return out
 
     @staticmethod
     def _enc_skill_map(mapping):
@@ -4727,6 +5294,45 @@ class LiveDamageMonitor:
         b["last"] = d.get("last")
         return b
 
+    def _buff_intervals(self):
+        """存檔用:自己身上 buff 的 (buffId, 名稱, 起, 迄, 層數) 區間,牆鐘秒。
+
+        起點一律夾到「按下開始」那一刻 —— 開始前就掛在身上的持久型 buff,
+        它的 start_wall 可能是幾十分鐘前,原樣寫進存檔會讓圖表算出超過 100%
+        的覆蓋率。整段都在開始之前的直接跳過。
+
+        兩個來源合起來 —— 已經 REM 的走 buff_history,還掛在身上的在這裡補一段:
+          * 無限持續:沒有排定的結束時間,收在「存檔當下」
+          * 有限:收在排定結束時間,但不得超過存檔當下 (還沒到期就是還沒到期)
+        沒到期卻已經被 REM 的、以及到期了沒收到 REM 的,兩種都自然落在正確長度。
+        """
+        now = time.time()
+        # 起點下界:按下開始的那一刻。沒按過開始就不夾 (沒有場次可言)
+        floor = self._monitor_start_wall
+        rows = []
+        for bid, nm, st, en, stk in list(self.buff_history):
+            if floor is not None:
+                if en <= floor:
+                    continue          # 整段都在開始之前,與這一場無關
+                st = max(st, floor)
+            rows.append((bid, nm, st, en, stk))
+        me = self.ident_self_entity
+        for info in self.active_buffs.values():
+            if me is None or info["owner"] != me:
+                continue
+            end = now if info["infinite"] else min(now, info["end_wall"])
+            start = info["start_wall"]
+            if floor is not None:
+                if end <= floor:
+                    continue
+                start = max(start, floor)
+            # 牆鐘可能被 NTP / 時區調整往回撥,那會撞出「迄早於起」的區間。
+            # 夾一下 —— 圖表畫到負寬度的長條會直接消失,查起來只會一頭霧水
+            rows.append((info["buff_id"], info["name"], start, max(start, end),
+                         info["stacks"]))
+        rows.sort(key=lambda r: r[2])
+        return rows
+
     def _snapshot_dict(self):
         """把目前狀態序列化成可寫入 JSON 的 dict。
         不存的東西:local_player_id / 身分綁定 / chosen_iface / settings /
@@ -4746,12 +5352,20 @@ class LiveDamageMonitor:
                 "events": [[round(ts, 3), f"0x{tid:08X}",
                             None if sid is None else f"0x{sid:08X}", dmg, flags]
                            for ts, tid, sid, dmg, flags in self.damage_events],
+                # 目標名字:只存「這份存檔真的有桶的目標」,整張 _entity_names
+                # 大多是路過沒打到的怪。序號在這裡就定死 (null = 存檔當下全場
+                # 只有這一隻),讀檔端不重算 —— eid 換一次執行就換了,重算沒有意義。
+                "entity_names": self._enc_entity_names(),
             },
             # 治癒只存三個總量:逐行治癒日誌目前沒有結構化緩衝 (直接寫進 widget),
             # 要一起存得先改 parse_heal_shield 的輸出路徑,這版不動
             "heal": {"total": self.heal_total,
                      "self": self.heal_self,
                      "ally": self.heal_ally},
+            # Buff 持續軸:圖表程式用它畫甘特條。時間與 damage.events 同一個
+            # 牆鐘,所以圖表可以直接拿 events 的 t0 當原點對齊
+            "buffs": [[f"0x{bid:08X}", nm, round(st, 3), round(en, 3), stk]
+                      for bid, nm, st, en, stk in self._buff_intervals()],
             "log_entries": [
                 {"text": e["text"],
                  "target": None if e["target"] is None else f"0x{e['target']:08X}",
@@ -4799,6 +5413,7 @@ class LiveDamageMonitor:
         return {
             "saved_at": raw.get("saved_at") or "?",
             "target_stats": stats,
+            "entity_names": self._dec_entity_names(dmg.get("entity_names")),
             "target_order": order,
             "selected_target": selected,
             "events": events,
@@ -4917,6 +5532,7 @@ class LiveDamageMonitor:
         self._reset_stats(clear_dev=False)
 
         self.target_stats = parsed["target_stats"]
+        self._loaded_names = parsed["entity_names"]
         self.target_order[:] = parsed["target_order"]
         self.selected_target = parsed["selected_target"]
         self.heal_total, self.heal_self, self.heal_ally = parsed["heal"]
@@ -4953,6 +5569,7 @@ class LiveDamageMonitor:
         self.target_stats = {TARGET_ALL: self._new_stat_bucket()}
         self.target_order.clear()
         self.selected_target = TARGET_ALL
+        self._loaded_names = {}   # 存檔的名字跟著存檔的統計一起走
         self._refresh_target_options()
 
         self.update_skill_ranking()
@@ -4972,6 +5589,11 @@ class LiveDamageMonitor:
         # 事件緩衝與畫面一起清 (只清 widget 的話切換目標會把舊事件叫回來)
         self.log_entries.clear()
         self.damage_events.clear()
+        # 已結束的 buff 區間與傷害事件同進退 (都是「這一場的記錄」)。
+        # active_buffs 不清 —— 那是當下的狀態,見 clear_data 的註解
+        self.buff_history.clear()
+        # 這一場從現在重新起算,區間起點的下界跟著移過來
+        self._monitor_start_wall = time.time()
         self._render_log()
 
         self.heal_log_area.configure(state="normal")
@@ -4998,6 +5620,10 @@ class LiveDamageMonitor:
         self.log("=== 數據已歸零 ===")
         # 注意:身分/綁定不清零 — 清了就得等下次換地圖才會再認出自己,
         # 中間所有傷害都不會被記錄 (同 local_player_id 的處置)。
+        # **buff 快取同理,也不清** — 「清除」清的是統計,buff 是當下的狀態不是統計;
+        # 而且 ADD 一輩子只送一次,清掉的無限持續 buff 永遠回不來 (實測踩過)。
+        # 換場景造成的殘留不必擔心:entityId 會變,update_buff_list 用
+        # owner == ident_self_entity 過濾,舊實體的 buff 自然就不顯示了。
         # 只把「本場尚未綁定」的診斷警告重新武裝,並把目前狀態重寫一行到日誌。
         self._ident_scene_warned = False
         self._ident_status_line()
