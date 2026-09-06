@@ -51,7 +51,7 @@ REM      of a raw entityId when this is bundled. Missing it degrades to hex, so 
 REM      missing file is not a build failure. Main program only - the graph viewer
 REM      reads target names out of the save file.
 set "ADD_MOBNAMES="
-if exist "..\Note\Ref\notice_monster_names_tw.json" set "ADD_MOBNAMES=--add-data=..\Note\Ref\notice_monster_names_tw.json;."
+if exist "notice_monster_names_tw.json" set "ADD_MOBNAMES=--add-data=notice_monster_names_tw.json;."
 if defined ADD_MOBNAMES     echo Monster names    : bundled
 if not defined ADD_MOBNAMES echo Monster names    : NOT FOUND - target bar will show hex only
 

@@ -36,6 +36,18 @@ jobs:
         working-directory: Source
         run: ./MabinogiMobileScribe_BuildTool.sh
 
+      # BuildTool.sh 在 set -e/-u 下可能提早中止卻回報成功
+      # (macOS bash 3.2 的 EXIT trap 會蓋掉離開碼),那時下一步只會抱怨
+      # 「working directory 不存在」,看不出真正的原因。這裡直接檢查產物。
+      - name: 確認產物存在
+        working-directory: Source
+        run: |
+          if [ ! -d "dist/MM Scribe.app" ]; then
+            echo "::error::建置沒有產出 dist/MM Scribe.app — 上一步的 BuildTool.sh 可能提早中止"
+            ls -la dist 2>/dev/null || echo "(dist 目錄不存在)"
+            exit 1
+          fi
+
       # 用 ditto 而非 zip:.app 是目錄結構,ditto 才會保留 symlink 與
       # 簽章所需的 metadata,否則解壓後的 app 會打不開。
       # 原始碼檔名不再帶版號(見 RELEASING.md),所以版號改讀 VERSION_STR。

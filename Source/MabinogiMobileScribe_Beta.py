@@ -8,18 +8,17 @@ macOS 上遊戲為 iOS App on Mac,流量直接走實體網卡,抓法與 Windows 
 
 打包說明 (實務上直接跑 MabinogiMobileScribe_BuildTool.bat / .sh,以下是等價的手動指令):
   怪物名對照表也要打包 —— 少了它目標欄位只能顯示 entityId 的 hex。
-  (Windows 這裡也寫成斜線:PyInstaller 兩種都吃,而反斜線在本 docstring 裡會變成跳脫序列)
 
   Windows 開發版 (顯示開發者選項):
-    python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "../Note/Ref/notice_monster_names_tw.json;." MabinogiMobileScribe_Beta.py
+    python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "notice_monster_names_tw.json;." MabinogiMobileScribe_Beta.py
 
   Windows 發布版 (隱藏開發者選項):
     type nul > RELEASE.marker
-    python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." --add-data "../Note/Ref/notice_monster_names_tw.json;." MabinogiMobileScribe_Beta.py
+    python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." --add-data "notice_monster_names_tw.json;." MabinogiMobileScribe_Beta.py
 
   macOS (--add-data 分隔符是 ':' 不是 ';'):
     touch RELEASE.marker
-    python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." --add-data "../Note/Ref/notice_monster_names_tw.json:." MabinogiMobileScribe_Beta.py
+    python -m PyInstaller --windowed --collect-data customtkinter --add-data "RELEASE.marker:." --add-data "notice_monster_names_tw.json:." MabinogiMobileScribe_Beta.py
 
   程式啟動時會偵測執行檔內是否包含 RELEASE.marker 檔案,
   存在則隱藏開發者選項按鈕(釋出給他人使用)。
@@ -395,13 +394,12 @@ def load_monster_names():
 
     目標按鈕要靠它把 entityId 顯示成怪物名,所以發布版也要載入。
     讀不到就整個功能靜默關閉 (目標欄位退回 hex),不影響任何統計。
-    原始碼佈局下檔案還放在 Note/Ref/,所以多找一層。
+    檔案與原始碼同層 (Source/),未打包時 get_resource_path 就找得到;
+    get_external_path 排前面是讓使用者能用 EXE 旁邊的檔案蓋掉內建版。
     """
     tried = set()
     for path in (get_external_path(MOB_NAME_FILE),
-                 get_resource_path(MOB_NAME_FILE),
-                 os.path.join(os.path.dirname(os.path.dirname(
-                     os.path.abspath(__file__))), "Note", "Ref", MOB_NAME_FILE)):
+                 get_resource_path(MOB_NAME_FILE)):
         if path in tried:
             continue
         tried.add(path)

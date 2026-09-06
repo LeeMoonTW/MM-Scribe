@@ -54,6 +54,11 @@ if [[ -d "$BASE/lib/tcl8.6" ]]; then
     export TK_LIBRARY="$BASE/lib/tk8.6"
 fi
 
+# 以下這些陣列都可能是空的。macOS 內建的 bash 是 3.2,在 set -u 底下展開空陣列
+# ("${A[@]}") 會被當成 unbound variable 直接中止,而 EXIT trap 又會把離開碼蓋成 0 ——
+# 結果就是 CI 上「建置成功」卻沒有 dist/。所以一律寫成 ${A[@]+"${A[@]}"}:
+# 陣列非空才展開,空的整段消失,bash 3.2 與 5.x 行為一致。
+
 # ---- Auto-detect icon files ----
 #     ICON_*     : .app 的圖示 (--icon,macOS 只吃 .icns)
 #     ADD_ICON_* : 打包 .png 進去,讓執行期的 iconphoto() 載得到
@@ -85,10 +90,10 @@ fi
 # 怪物名對照表:目標欄位要靠它把 entityId 顯示成怪物名,少了只會退回 hex,
 # 所以找不到不算失敗。只給主程式 —— 圖表閱覽器的名字是從存檔讀的,不必吃這 200KB。
 MOBNAMES=()
-if [[ -f ../Note/Ref/notice_monster_names_tw.json ]]; then
-    MOBNAMES=(--add-data=../Note/Ref/notice_monster_names_tw.json:.)
+if [[ -f notice_monster_names_tw.json ]]; then
+    MOBNAMES=(--add-data=notice_monster_names_tw.json:.)
 else
-    echo "[WARN] 找不到 ../Note/Ref/notice_monster_names_tw.json — 目標欄位只會顯示 hex"
+    echo "[WARN] 找不到 notice_monster_names_tw.json — 目標欄位只會顯示 hex"
 fi
 
 echo "Bundled configs  : ${CONFIGS[*]:-none}"
@@ -103,7 +108,7 @@ echo " Step 1/4 : Build DEV version (with developer options)"
 echo "============================================================"
 "$PY" -m PyInstaller --windowed --noconfirm \
     --collect-data customtkinter \
-    "${ICON_DEV[@]}" "${ADD_ICON_DEV[@]}" "${CONFIGS[@]}" "${MOBNAMES[@]}" \
+    ${ICON_DEV[@]+"${ICON_DEV[@]}"} ${ADD_ICON_DEV[@]+"${ADD_ICON_DEV[@]}"} ${CONFIGS[@]+"${CONFIGS[@]}"} ${MOBNAMES[@]+"${MOBNAMES[@]}"} \
     --name "MM Scribe Dev" \
     "$SCRIPT"
 
@@ -121,7 +126,7 @@ echo "============================================================"
 "$PY" -m PyInstaller --windowed --noconfirm \
     --collect-data customtkinter \
     --add-data "RELEASE.marker:." \
-    "${ICON_REL[@]}" "${ADD_ICON_REL[@]}" "${CONFIGS[@]}" "${MOBNAMES[@]}" \
+    ${ICON_REL[@]+"${ICON_REL[@]}"} ${ADD_ICON_REL[@]+"${ADD_ICON_REL[@]}"} ${CONFIGS[@]+"${CONFIGS[@]}"} ${MOBNAMES[@]+"${MOBNAMES[@]}"} \
     --name "MM Scribe" \
     "$SCRIPT"
 
@@ -137,7 +142,7 @@ if [[ -n "$GRAPH" ]]; then
     "$PY" -m PyInstaller --windowed --noconfirm \
         --collect-data customtkinter \
         --add-data "VERSION.txt:." \
-        "${ICON_REL[@]}" "${ADD_ICON_REL[@]}" "${CONFIGS[@]}" \
+        ${ICON_REL[@]+"${ICON_REL[@]}"} ${ADD_ICON_REL[@]+"${ADD_ICON_REL[@]}"} ${CONFIGS[@]+"${CONFIGS[@]}"} \
         --name "MM Scribe Graph" \
         "$GRAPH"
     rm -f VERSION.txt
