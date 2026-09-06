@@ -8,13 +8,16 @@ macOS 上遊戲為 iOS App on Mac,流量直接走實體網卡,抓法與 Windows 
 
 打包說明 (實務上直接跑 MabinogiMobileScribe_BuildTool.bat / .sh,以下是等價的手動指令):
   怪物名對照表也要打包 —— 少了它目標欄位只能顯示 entityId 的 hex。
+  Windows 版一律加 --noupx:UPX 加殼會被 Defender 的 ML 啟發式判成
+  Trojan:Win32/Wacatac.B!ml。BuildTool.bat 另外會用 make_version_file.py
+  產生 --version-file,補上空白的 exe metadata(同一個誤判的另一個成因)。
 
   Windows 開發版 (顯示開發者選項):
-    python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "notice_monster_names_tw.json;." MabinogiMobileScribe_Beta.py
+    python -m PyInstaller --onefile --noconsole --noupx --collect-data customtkinter --add-data "notice_monster_names_tw.json;." MabinogiMobileScribe_Beta.py
 
   Windows 發布版 (隱藏開發者選項):
     type nul > RELEASE.marker
-    python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." --add-data "notice_monster_names_tw.json;." MabinogiMobileScribe_Beta.py
+    python -m PyInstaller --onefile --noconsole --noupx --collect-data customtkinter --add-data "RELEASE.marker;." --add-data "notice_monster_names_tw.json;." MabinogiMobileScribe_Beta.py
 
   macOS (--add-data 分隔符是 ':' 不是 ';'):
     touch RELEASE.marker

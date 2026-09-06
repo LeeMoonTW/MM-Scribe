@@ -70,7 +70,10 @@ if exist "MM Scribe Graph.spec" del "MM Scribe Graph.spec" >nul 2>&1
 echo ============================================================
 echo  Step 1/4 : Build DEV version (with developer options)
 echo ============================================================
-python -m PyInstaller --onefile --noconsole ^
+call :mkversion "MM Scribe Dev.exe" "MM Scribe Dev"
+if errorlevel 1 goto :error
+python -m PyInstaller --onefile --noconsole --noupx ^
+    --version-file=version_info.txt ^
     --collect-data customtkinter ^
     %ICON_DEV% ^
     %ADD_ICON_DEV% ^
@@ -90,7 +93,10 @@ echo.
 echo ============================================================
 echo  Step 3/4 : Build RELEASE version (developer options hidden)
 echo ============================================================
-python -m PyInstaller --onefile --noconsole ^
+call :mkversion "MM Scribe.exe" "MM Scribe"
+if errorlevel 1 goto :error
+python -m PyInstaller --onefile --noconsole --noupx ^
+    --version-file=version_info.txt ^
     --collect-data customtkinter ^
     --add-data "RELEASE.marker;." ^
     %ICON_REL% ^
@@ -120,7 +126,10 @@ if errorlevel 1 goto :error
 set /p GRAPH_VER=<VERSION.txt
 echo Graph version : %GRAPH_VER%
 
-python -m PyInstaller --onefile --noconsole ^
+call :mkversion "MM Scribe Graph.exe" "MM Scribe Graph"
+if errorlevel 1 goto :error
+python -m PyInstaller --onefile --noconsole --noupx ^
+    --version-file=version_info.txt ^
     --collect-data customtkinter ^
     --add-data "VERSION.txt;." ^
     %ICON_REL% ^
@@ -138,6 +147,7 @@ echo    Dev     : dist\MM Scribe Dev.exe
 echo    Release : dist\MM Scribe.exe
 if defined GRAPH echo    Graph   : dist\MM Scribe Graph.exe
 echo ============================================================
+if exist version_info.txt del version_info.txt >nul 2>&1
 pause
 exit /b 0
 
@@ -148,5 +158,19 @@ echo  BUILD FAILED - Check error messages above
 echo ============================================================
 if exist RELEASE.marker del RELEASE.marker >nul 2>&1
 if exist VERSION.txt del VERSION.txt >nul 2>&1
+if exist version_info.txt del version_info.txt >nul 2>&1
 pause
 exit /b 1
+
+REM ============================================================
+REM  :mkversion <exe filename> <product name>
+REM
+REM  Writes the PE version resource consumed by --version-file above.
+REM  An exe with blank metadata (no company / product / copyright) scores badly
+REM  in Defender's ML heuristics; that plus UPX packing is what got the release
+REM  zip flagged as Trojan:Win32/Wacatac.B!ml, hence --noupx on every build too.
+REM  Version numbers come from the main program's VERSION_STR, as everywhere else.
+REM ============================================================
+:mkversion
+python make_version_file.py version_info.txt %1 %2
+exit /b %errorlevel%
