@@ -4352,7 +4352,14 @@ class LiveDamageMonitor:
             # 若已由開機自動偵測 or 手動掃描選定網卡,就綁在那張;否則交給 scapy 自選
             if self.chosen_iface:
                 sniff_kwargs["iface"] = self.chosen_iface
-            sniff(**sniff_kwargs)
+            # 預設不開混雜模式:我們只要自己這台機器的封包,關掉可避開部分
+            # 網卡/驅動不允許 promiscuous 的情況。失敗才退回 scapy 預設。
+            try:
+                sniff(promisc=False, **sniff_kwargs)
+            except Exception as e:
+                self.root.after(0, lambda err=e: self.log(
+                    f"⚠️ 非 promiscuous 模式擷取失敗 ({err}),改用預設模式重試"))
+                sniff(**sniff_kwargs)
         except Exception as e:
             self.root.after(0, lambda err=e: self.log(f"❌ 攔截錯誤: {err}"))
 
