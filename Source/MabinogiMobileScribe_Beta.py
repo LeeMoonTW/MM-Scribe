@@ -100,6 +100,12 @@ TARGET_ALL_LABEL = "All"
 TARGET_BTN_SELECTED = "#3a6a9a"    # 目標按鈕:選中
 TARGET_BTN_IDLE = "#2a2a2a"        # 目標按鈕:未選中
 TARGET_SORT_INTERVAL_MS = 3000     # 目標按鈕列依累積傷害重排的週期
+# 目標按鈕寬度用「顯示單位」估算 (CJK 算 2 單位),不量實際字型 —
+# 量測值是螢幕像素,而 width= 吃的是 CTk 縮放後的單位,HiDPI 下會對不上。
+TARGET_BTN_UNIT_W = 9              # 每單位估算寬度 (0x + 8 碼 = 10 單位 ≈ 舊的 96)
+TARGET_BTN_MIN_W = 60
+TARGET_BTN_MAX_W = 200             # 名字再長也不讓單顆按鈕吃掉整條列
+TARGET_NAME_MAX_UNITS = 20         # 超過就截斷加省略號
 # 攻擊日誌保留筆數上限 (切換目標時要依此緩衝重畫整份,故需有上界)
 LOG_HISTORY_MAX = 5000
 # === 傷害事件時間序列 (給日後的傷害曲線圖表用,不顯示在日誌上) ===
@@ -259,6 +265,7 @@ MOB_SEEN_MAX = 256                # 記住幾隻已印過的怪 (避免同一隻
 MOB_LOG_MAX = 300                 # 詳細行總量上限,超過只留累計數字
 MOB_TALLY_EVERY = 20              # 每收幾則登場包印一次累計
 MOB_NAME_FILE = "notice_monster_names_tw.json"
+ENTITY_NAME_MAX = 2048            # 記住幾隻怪的 eid → 名字 (給目標欄位用,與 MOB_SEEN_MAX 無關)
 MOB_HEAD_SENTINEL = b"\x03\x00\x00\x00"   # 前哨
 MOB_TAIL_SENTINEL = b"\x00\x00\x00\x00"   # 後哨
 # 掃到這三個一律當沒掃到,繼續往前找 (對照表裡確認過沒有這三個鍵)
@@ -532,6 +539,30 @@ def save_settings(settings):
             parser.write(f)
     except Exception:
         pass
+
+
+def display_units(text):
+    """估算顯示寬度單位:CJK / 全形算 2,其餘算 1。只拿來估按鈕寬度,不必精確。"""
+    return sum(2 if ord(ch) > 0x2E7F else 1 for ch in text)
+
+
+def clip_units(text, limit):
+    """依顯示單位截斷過長的名字,尾端補省略號。"""
+    if display_units(text) <= limit:
+        return text
+    out, used = [], 0
+    for ch in text:
+        w = 2 if ord(ch) > 0x2E7F else 1
+        if used + w > limit - 1:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + "…"
+
+
+def target_btn_width(text):
+    return min(TARGET_BTN_MAX_W,
+               max(TARGET_BTN_MIN_W, display_units(text) * TARGET_BTN_UNIT_W + 12))
 
 
 def format_skill_name(skill_id):
@@ -3223,11 +3254,36 @@ class LiveDamageMonitor:
         self.target_order.append(target_id)
         self.root.after(0, self._refresh_target_options)
 
+    def _target_label(self, key):
+        """目標按鈕文字:登場包 (0x4E4C) 認得出來就顯示怪物名,否則退回 0x + 8 碼 hex。
+
+        同名的怪加上「#出現序」才分得出個體;全場只出現過一隻就不加 —
+        單體 Boss 掛個 #1 只是雜訊。
+        """
+        if key == TARGET_ALL:
+            return TARGET_ALL_LABEL
+        entry = self._entity_names.get(key)
+        if entry is None:
+            return f"0x{key:08X}"
+        name, ordinal = entry
+        label = clip_units(name, TARGET_NAME_MAX_UNITS)
+        return label if self._name_count[name] <= 1 else f"{label} #{ordinal}"
+
+    def _refresh_target_labels(self):
+        """只更新既有按鈕的文字/寬度,不重建 widget。
+        一場幾十則登場包,每則都重建整條列會閃到不能看。
+        """
+        for key, btn in self.target_buttons.items():
+            if key == TARGET_ALL:
+                continue
+            text = self._target_label(key)
+            if btn.cget("text") != text:
+                btn.configure(text=text, width=target_btn_width(text))
+
     def _refresh_target_options(self):
         """依 target_order 重建目標按鈕列;維持目前選取不變。
-        按鈕文字刻意只放 Entity ID (不含傷害數字),這樣只有「出現新對象」時才需要
-        重建,不必每筆傷害都動 widget。
-        ID 用 hex 呈現,與技能欄/開發者 log 的 0x + 8 碼慣例一致。
+        按鈕文字刻意不含傷害數字,這樣只有「出現新對象」時才需要重建,
+        不必每筆傷害都動 widget;名字晚到則走 _refresh_target_labels 原地改字。
         """
         for btn in self.target_buttons.values():
             btn.destroy()
@@ -3243,7 +3299,8 @@ class LiveDamageMonitor:
 
         add(TARGET_ALL, TARGET_ALL_LABEL, 46)
         for tid in self.target_order:
-            add(tid, f"0x{tid:08X}", 96)
+            text = self._target_label(tid)
+            add(tid, text, target_btn_width(text))
 
         # 選取的目標已不存在 (例如 clear_data 之後) → 退回 All
         if self.selected_target not in self.target_buttons:
@@ -3709,6 +3766,10 @@ class LiveDamageMonitor:
         """清空探針狀態。與身分偵測分開,免得互相干擾。"""
         self._mob_streams = collections.OrderedDict()   # 連線 key → 進行中的訊息
         self._mob_seen = collections.OrderedDict()      # entityId → 已印過的怪物碼
+        # 目標欄位要顯示的名字。獨立於 _mob_seen — 後者是 256 筆的洗版防護,
+        # 會把還在打的怪的名字擠掉。這份只增不改,直到超過 ENTITY_NAME_MAX。
+        self._entity_names = collections.OrderedDict()  # entityId → (怪物名, 同名第幾隻)
+        self._name_count = collections.Counter()        # 怪物名 → 已見過幾隻 (給序號)
         self._mob_lines = 0        # 已印的詳細行數 (上限 MOB_LOG_MAX)
         self._mob_n_msg = 0        # 收到幾則「完整收齊」的登場包
         self._mob_n_named = 0      # 掃到碼且查得到名字
@@ -3874,6 +3935,7 @@ class LiveDamageMonitor:
         name = MONSTER_NAMES.get(code)
         if name:
             self._mob_n_named += 1
+            self._remember_entity_name(eid, name)
         else:
             self._mob_n_unknown += 1
         # 同一隻 (eid + 同一個碼) 只印一次 — 登場包會重送
@@ -3883,10 +3945,26 @@ class LiveDamageMonitor:
         while len(self._mob_seen) > MOB_SEEN_MAX:
             self._mob_seen.popitem(last=False)
         if name:
-            self._mob_note(f"[MOB] eid={eid} code={code} → {name} ({eid & 0xFF})")
+            self._mob_note(f"[MOB] eid={eid} code={code} → {self._target_label(eid)}")
         else:
             self._mob_note(f"[MOB] eid={eid} code={code} → 查表無此碼 "
                            f"(Monster {eid})")
+
+    def _remember_entity_name(self, eid, name):
+        """登場包認出一隻怪 → 記下 eid → (名字, 同名第幾隻),並補刷目標按鈕文字。
+
+        序號在「第一次看到這個 eid」時就固定,登場包會重送,不固定就會一直往上跳。
+        序號不用 eid & 0xFF — 實測同一場的不同怪會撞號 (38624132 與 38624900 都是 132)。
+        """
+        if eid in self._entity_names:
+            return
+        self._name_count[name] += 1
+        self._entity_names[eid] = (name, self._name_count[name])
+        while len(self._entity_names) > ENTITY_NAME_MAX:
+            self._entity_names.popitem(last=False)
+        # 這隻可能已經在目標列上了 (傷害先到 / 名字晚到),同名第二隻出現時
+        # 也要回頭把第一隻的序號補上 → 一律重刷文字,不重建 widget。
+        self.root.after(0, self._refresh_target_labels)
 
     @staticmethod
     def _mob_find_code(plain, head_only=False):
