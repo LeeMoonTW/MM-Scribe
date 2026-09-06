@@ -208,6 +208,8 @@ IDENT_SELF_FEED_MAX = 1 << 18     # 餵超過這麼多 bytes 還吐不出 8 byte
 IDENT_APPEAR_MIN_SIZE = 64        # B 訊息實測 1100~1300 bytes;放寬下限只擋明顯假的
 IDENT_APPEAR_HEAD_BYTES = 4096    # B 訊息解壓前幾 bytes,拿來找 characterId
 IDENT_APPEAR_CACHE_MAX = 64       # 身分還沒到手前,先留這麼多筆 B 訊息回頭比對
+IDENT_MATCH_OFF_MAX = 4           # 一則 B 訊息裡最多記幾個 characterId 命中位移
+IDENT_REJECT_LOG_MAX = 5          # 同一場最多記幾行「拒絕改綁」,免得洗版
 IDENT_MAX_SIZE = 1 << 20          # contentLength 上限 (超過視為對錯位撞出來的假標頭)
 IDENT_STREAM_MAX = 8              # 同時追蹤幾條 TCP 連線的「收到一半的訊息」
 # 攻擊事件日誌上的角色 ID 狀態列 (紅字 / 綠字)。沒有角色 ID 時傷害一律不記錄,
@@ -229,6 +231,11 @@ TOOLTIP_DELAY_MS = 400            # 滑鼠停留多久才跳提示
 DEV_LOG_MAX = 800                 # 緩衝保留幾行 (超過丟最舊的)
 DEV_STRIP_MAX_CHARS = 160         # 單行顯示上限,超過截斷加省略號
 DEV_STRIP_EMPTY = "🛠 診斷 LOG — 尚無訊息  (點擊展開)"
+# 診斷 LOG 的上色:整片灰字裡身分偵測出問題那幾行必須一眼認得出來。
+# dev_log() 依訊息裡的標記自動判定 (順序 = 優先權),也可以由呼叫端明寫 tag。
+DEV_TAG_MARKS = (("✗", "dev_err"), ("⚠", "dev_warn"), ("★", "dev_ok"))
+DEV_TAG_COLORS = {"dev_err": "#ff5555", "dev_warn": "#ffcc4d", "dev_ok": "#4dd471"}
+DEV_STRIP_IDLE_COLOR = "#888888"      # 底部單行沒有標記時的灰
 IDENT_SELF_MAGIC = struct.pack("<I", IDENT_SELF_TYPE)
 IDENT_APPEAR_MAGIC = struct.pack("<I", IDENT_APPEAR_TYPE)
 # ---- 怪物登場包探針 (0x4E4C) — 開發者 LOG 觀測用,不進統計 ----
@@ -954,6 +961,7 @@ class LiveDamageMonitor:
         # 診斷 LOG 展開視窗:一律獨立 Toplevel (底部區塊點一下才開)
         self._dev_popout_win = None
         # 診斷 LOG 緩衝:底部區塊與展開視窗都從這裡取內容 (見 dev_log)
+        # 每筆存 (文字, 顏色 tag);tag 為 None = 一般灰字
         self._dev_lines = collections.deque(maxlen=DEV_LOG_MAX)
 
         # 提前建立 collapse 狀態與 merge_var,讓 pane 重建 (dock/popout) 時值可延續
@@ -1509,6 +1517,8 @@ class LiveDamageMonitor:
         self.dev_log_area = ctk.CTkTextbox(self.dev_pane, wrap="none", font=(FONT_MONO, 12),
                                            corner_radius=0)
         self.dev_log_area.pack(fill="both", expand=True, padx=6, pady=6)
+        for tag, color in DEV_TAG_COLORS.items():
+            self.dev_log_area._textbox.tag_config(tag, foreground=color)
         self.dev_log_area.configure(state="disabled")
 
     def _popout_dev(self):
@@ -1533,8 +1543,14 @@ class LiveDamageMonitor:
         self._build_dev_pane(win)
         self.dev_pane.pack(fill="both", expand=True, padx=6, pady=6)
         if self._dev_lines:
+            # 一次 insert 全文再用行號補 tag (逐行 insert 數百筆會卡,同 _render_log)
             self.dev_log_area.configure(state="normal")
-            self.dev_log_area.insert("1.0", "\n".join(self._dev_lines) + "\n")
+            self.dev_log_area.insert("1.0",
+                                     "\n".join(t for t, _ in self._dev_lines) + "\n")
+            box = self.dev_log_area._textbox
+            for row, (_, tag) in enumerate(self._dev_lines, start=1):
+                if tag:
+                    box.tag_add(tag, f"{row}.0", f"{row}.end+1c")
             self.dev_log_area.see("end")
             self.dev_log_area.configure(state="disabled")
         # 主視窗如果目前是置頂,新開的 popout 也要一起置頂
@@ -3026,13 +3042,15 @@ class LiveDamageMonitor:
             self.dev_log("⚠ 未安裝 brotli,enc=1 的封包只看得到壓縮位元組 "
                          "(pip install brotli),角色 ID 偵測也會失效")
         if self.ident_self is None:
-            self.dev_log("[ID] 尚未取得自己的身分 — 等 0x4FFF「我的角色資料」出現"
+            self.dev_log("[ID] ⚠ 尚未取得自己的身分 — 等 0x4FFF「我的角色資料」出現"
                          "(換地圖時會送)")
         else:
             acc, idx = self.ident_self
             bound = ("0x%08X" % self.ident_self_entity
                      if self.ident_self_entity is not None else "未綁定")
-            self.dev_log(f"[ID] 目前身分: 帳號碼={acc} 角色索引={idx} | 自己 = {bound}")
+            mark = "★" if self.ident_self_entity is not None else "⚠"
+            self.dev_log(f"[ID] {mark} 目前身分: 帳號碼={acc} 角色索引={idx} | "
+                         f"自己 = {bound}")
         if MONSTER_NAMES:
             self.dev_log(f"[MOB] 怪物名對照表已載入 {len(MONSTER_NAMES):,} 筆 — "
                          f"0x{MOB_APPEAR_TYPE:04X} 登場包探針啟用 (純觀測,不進統計)")
@@ -3120,22 +3138,41 @@ class LiveDamageMonitor:
         self._append_log(text, target=target_id, tags=tags)
 
 
-    def dev_log(self, text):
-        """診斷訊息:進緩衝 → 更新底部單行 → 展開視窗開著就一併寫入。"""
-        self._dev_lines.append(text)
+    @staticmethod
+    def _dev_tag_of(text):
+        """依訊息裡的標記決定顏色 tag (見 DEV_TAG_MARKS);沒有標記回 None。"""
+        for mark, tag in DEV_TAG_MARKS:
+            if mark in text:
+                return tag
+        return None
+
+    def dev_log(self, text, tag=None):
+        """診斷訊息:進緩衝 → 更新底部單行 → 展開視窗開著就一併寫入。
+
+        tag 省略時依訊息裡的 ✗ / ⚠ / ★ 自動上色 —— 身分偵測失敗那幾行
+        (抓不到角色 ID / 本場尚未綁定) 才不會被淹沒在整片灰字裡。
+        """
+        if tag is None:
+            tag = self._dev_tag_of(text)
+        self._dev_lines.append((text, tag))
         # 底部只有一行,換行字元會把 button 撐高,長行也要截斷
         line = text.replace("\n", " ")
         if len(line) > DEV_STRIP_MAX_CHARS:
             line = line[:DEV_STRIP_MAX_CHARS - 1] + "…"
         try:
-            self.dev_strip.configure(text=line)
+            # 收合狀態下只看得到這一條,顏色跟著最新一行走
+            self.dev_strip.configure(
+                text=line, text_color=DEV_TAG_COLORS.get(tag, DEV_STRIP_IDLE_COLOR))
         except Exception:
             pass
         # 視窗關閉時 widget 不存在 (寫入是 after() 排程,可能晚於關窗)
         if self.dev_log_area is None:
             return
         self.dev_log_area.configure(state="normal")
-        self.dev_log_area.insert("end", text + "\n")
+        if tag:
+            self.dev_log_area._textbox.insert("end", text + "\n", tag)
+        else:
+            self.dev_log_area.insert("end", text + "\n")
         self.dev_log_area.see("end")
         self.dev_log_area.configure(state="disabled")
 
@@ -3370,6 +3407,8 @@ class LiveDamageMonitor:
         self._ident_scene_appear = 0      # 本場收到幾筆玩家出現訊息
         self._ident_scene_full = 0        # 其中 body 完整收齊的幾筆
         self._ident_scene_hit = 0         # 命中自己的幾筆
+        self._ident_scene_reject = 0      # 命中但被判為參照欄位、拒絕改綁的幾筆
+        self._ident_bind_offs = ()        # 本場綁定那筆的 characterId 出現位移
         self._ident_scene_warned = False  # 開發者面板的「本場尚未綁定」是否已警告過
         self._ident_no_id_logged = False  # 攻擊日誌的紅字本場是否已寫過
 
@@ -3460,7 +3499,8 @@ class LiveDamageMonitor:
                 fn = None
         if fn is None:
             if kind == "self":
-                self._ident_log("[ID] 未安裝 brotli,無法解出自己的身分 (pip install brotli)")
+                self._ident_log("[ID] ✗ 未安裝 brotli,無法解出自己的身分 "
+                                "(pip install brotli)")
             kind = "skip"
         st = {"kind": kind, "size": size, "need": size, "got": 0,
               "fn": fn, "out": bytearray(), "done": False}
@@ -3488,7 +3528,7 @@ class LiveDamageMonitor:
                 out = st["fn"](bytes(data))
             except Exception as exc:
                 if st["kind"] == "self":
-                    self._ident_log(f"[ID] 我的角色資料解壓中斷 ({exc.__class__.__name__}),"
+                    self._ident_log(f"[ID] ⚠ 我的角色資料解壓中斷 ({exc.__class__.__name__}),"
                                     f"已收 {st['got']}B — 本工具不做 TCP 重組,"
                                     f"重傳或亂序會直接打斷串流")
                 st["kind"] = "skip"
@@ -3501,7 +3541,8 @@ class LiveDamageMonitor:
                     st["kind"] = "skip"
                     st["out"] = bytearray()
                 elif st["got"] >= IDENT_SELF_FEED_MAX:
-                    self._ident_log(f"[ID] 已收 {st['got']}B 仍吐不出前 8 bytes,放棄本則")
+                    self._ident_log(f"[ID] ⚠ 已收 {st['got']}B 仍吐不出前 8 bytes,"
+                                    f"放棄本則 — 本場可能因此抓不到角色 ID")
                     st["kind"] = "skip"
             elif st["kind"] == "appear" and len(st["out"]) >= IDENT_APPEAR_HEAD_BYTES:
                 self._ident_finish_appear(st)
@@ -3519,7 +3560,7 @@ class LiveDamageMonitor:
         """
         index, account, reserved = struct.unpack("<HIH", head8)
         if reserved != 0:
-            self._ident_log(f"[ID] 解出 reserved={reserved} ≠ 0 → 判為假陽性,丟棄")
+            self._ident_log(f"[ID] ⚠ 解出 reserved={reserved} ≠ 0 → 判為假陽性,丟棄")
             return
         ident = (account, index)
         prev_entity = self.ident_self_entity
@@ -3552,7 +3593,7 @@ class LiveDamageMonitor:
         if full:
             self._ident_scene_full += 1
         eid = struct.unpack("<I", plain[:4])[0] if len(plain) >= 4 else None
-        off = None
+        offs = ()
         if eid is not None:
             if self.ident_self is None:
                 # 身分還沒到手 → 先留著,等 A 訊息來了回頭掃 (兩個方向都要做)
@@ -3561,33 +3602,59 @@ class LiveDamageMonitor:
                 while len(self._ident_appear_cache) > IDENT_APPEAR_CACHE_MAX:
                     self._ident_appear_cache.popitem(last=False)
             else:
-                off = self._ident_match_offset(plain)
+                offs = self._ident_match_offsets(plain)
         # 別人的出現訊息不寫 LOG (一次換圖十幾筆,只會洗版) — 只累計數字,
         # 供「本場尚未綁定」那行診斷用
-        if off is not None:
+        if offs:
             self._ident_scene_hit += 1
-            self._ident_bind(eid, off)
+            self._ident_bind(eid, offs)
 
-    def _ident_match_offset(self, plain):
-        """在解壓內容裡找 u64 characterId == 我的身分,回傳位移;沒有則 None。
+    def _ident_match_offsets(self, plain):
+        """在解壓內容裡找 u64 characterId == 我的身分,回傳「所有」出現位移。
 
         比對鍵是帳號碼與角色索引「兩個都要相等」— 拆開比會綁到同帳號的別隻角色,
         或撞到別的帳號 (角色索引 4、5 這種小數字滿地都是)。
+
+        回全部而不是第一個:命中不代表這則訊息「就是在講我」—— 別人的登場訊息
+        裡也可能帶著我的 characterId 當參照欄位 (見 _ident_bind)。位移與出現
+        次數是事後分辨誰是誰的唯一線索,兩個都要留在 LOG 裡。
         """
         if self.ident_self is None:
-            return None
+            return ()
         account, index = self.ident_self
-        off = plain.find(struct.pack("<Q", account << 16 | index))
-        return None if off < 0 else off
+        needle = struct.pack("<Q", account << 16 | index)
+        offs = []
+        pos = plain.find(needle)
+        while pos >= 0 and len(offs) < IDENT_MATCH_OFF_MAX:
+            offs.append(pos)
+            pos = plain.find(needle, pos + 1)
+        return tuple(offs)
 
-    def _ident_bind(self, eid, off):
+    @staticmethod
+    def _fmt_offs(offs):
+        return "+" + ", +".join(str(o) for o in offs) if offs else "無"
+
+    def _ident_bind(self, eid, offs):
+        """把「自己」綁到某個實體;offs = 我的 characterId 在該則訊息裡的所有位移。
+
+        **同一場只認第一個命中者。** A 訊息 (換場景) 一律解除綁定,所以一場裡
+        「自己」的實體 ID 不會變;同場再冒出第二個帶著我 characterId 的實體,
+        那個 characterId 必然是別人訊息裡的**參照欄位**,不是他的身分。
+
+        已知來源 (使用者回報,尚無本地封包樣本佐證):自己是隊長時,新成員加入
+        隊伍會送出登場訊息,內容帶著隊長的 characterId。舊版「後者覆蓋前者」
+        因此把自己綁到新成員身上,之後的傷害統計整場報廢。當隊員時不會發生
+        —— 別人訊息裡帶的是隊長的 ID,不是自己的。
+        """
         if self.ident_self_entity == eid:
             return
-        prev = self.ident_self_entity
+        if self.ident_self_entity is not None:
+            self._ident_reject_rebind(eid, offs)
+            return
         self.ident_self_entity = eid
-        note = (f" (原 0x{prev:08X} → 重新綁定)" if prev is not None else " (本場首次綁定)")
-        self._ident_log(f"[ID] ★ 自己 = 實體 0x{eid:08X}{note} | "
-                        f"characterId 位於解壓後位移 +{off}")
+        self._ident_bind_offs = offs
+        self._ident_log(f"[ID] ★ 自己 = 實體 0x{eid:08X} (本場首次綁定) | "
+                        f"characterId 位於解壓後位移 {self._fmt_offs(offs)}")
         self._ident_notify_ok()
         # 治癒端的 0x502A 學習是唯一獨立於本規則的自身 ID 來源 (見 parse_heal_shield §5),
         # 學到的話拿來當第二個佐證 —— 只有一個來源就分不出對錯
@@ -3596,18 +3663,42 @@ class LiveDamageMonitor:
             same = "一致" if (lp & 0xFFFFFFFF) == eid else "不一致"
             self._ident_log(f"[ID] 對照治癒端學到的本地 ID 0x{lp:X}: {same}")
 
+    def _ident_reject_rebind(self, eid, offs):
+        """本場已綁定,又有別的實體帶著我的 characterId → 預設拒絕改綁。
+
+        唯一的例外是治癒端學到的 local_player_id (見 parse_heal_shield §5):
+        那是獨立於本規則的第二個來源,它指向新候選就代表目前綁的才是錯的。
+        """
+        self._ident_scene_reject += 1
+        lp = self.local_player_id
+        if lp is not None and (lp & 0xFFFFFFFF) == eid:
+            old = self.ident_self_entity
+            self.ident_self_entity = eid
+            self._ident_bind_offs = offs
+            self._ident_log(
+                f"[ID] ⚠ 改綁 0x{old:08X} → ★ 0x{eid:08X} — 治癒端學到的本地 ID "
+                f"0x{lp:X} 指向後者,以獨立來源為準")
+            return
+        if self._ident_scene_reject > IDENT_REJECT_LOG_MAX:
+            return
+        self._ident_log(
+            f"[ID] ⚠ 忽略候選 0x{eid:08X} (位移 {self._fmt_offs(offs)}) — 本場已綁定 "
+            f"0x{self.ident_self_entity:08X} (位移 {self._fmt_offs(self._ident_bind_offs)})。"
+            f"同一場的實體 ID 不會變,多出來的命中是別人訊息裡的參照欄位 "
+            f"(已知:自己當隊長時,新成員的登場訊息帶著隊長的 characterId)")
+
     def _ident_rescan_cache(self):
         """A 訊息晚到:回頭掃已快取的 B 訊息。"""
         if not self._ident_appear_cache:
             return
         hits = 0
         for eid, plain in list(self._ident_appear_cache.items()):
-            off = self._ident_match_offset(plain)
-            if off is not None:
+            offs = self._ident_match_offsets(plain)
+            if offs:
                 hits += 1
-                self._ident_bind(eid, off)
+                self._ident_bind(eid, offs)
         self._ident_log(f"[ID] 回掃 {len(self._ident_appear_cache)} 筆已快取的玩家出現訊息,"
-                        f"命中 {hits} 筆")
+                        f"命中 {hits} 筆 (採用第 1 筆,其餘視為參照欄位)")
         self._ident_appear_cache.clear()
 
     # ================================================
@@ -3898,9 +3989,19 @@ class LiveDamageMonitor:
                             if (self.ident_self_entity is None
                                     and not self._ident_scene_warned):
                                 self._ident_scene_warned = True
+                                # 分三種斷法:連身分都沒有 / 有身分但沒收到出現訊息 /
+                                # 收到了卻沒一筆命中 —— 連續進副本偶發失敗靠這行分辨
+                                if self.ident_self is None:
+                                    why = "連身分都還沒解出 (沒收到或沒解開 0x4FFF)"
+                                elif self._ident_scene_full == 0:
+                                    why = "沒有任何一筆出現訊息收完整 (串流被打斷)"
+                                elif self._ident_scene_hit == 0:
+                                    why = "出現訊息收到了但沒一筆命中自己"
+                                else:
+                                    why = "已命中卻未綁定 (不該發生)"
                                 self._ident_log(
-                                    f"[ID] ⚠ 本場尚未綁定 — 已收到 "
-                                    f"{self._ident_scene_appear} 筆出現訊息 "
+                                    f"[ID] ⚠ 本場尚未綁定,傷害不會記錄 — {why} | "
+                                    f"已收到 {self._ident_scene_appear} 筆出現訊息 "
                                     f"(完整 {self._ident_scene_full} 筆, "
                                     f"命中 {self._ident_scene_hit} 筆)")
                             dev_msg = (f"[Flag] 數值: {dmg_val} | "
@@ -4803,7 +4904,8 @@ class LiveDamageMonitor:
         if clear_dev:
             self._dev_lines.clear()
             try:
-                self.dev_strip.configure(text=DEV_STRIP_EMPTY)
+                self.dev_strip.configure(text=DEV_STRIP_EMPTY,
+                                         text_color=DEV_STRIP_IDLE_COLOR)
             except Exception:
                 pass
             if self.dev_log_area is not None:

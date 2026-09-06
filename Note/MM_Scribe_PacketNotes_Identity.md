@@ -62,6 +62,10 @@ off  size  欄位
 | 解壓後 +0 | `u32 entityId` |
 | `characterId` | `u64`，位在解壓後 **約 +2600**（實測 +2604 / +2605；**位移不是常數，一律用搜尋，不要寫死**） |
 
+> **命中 ≠ 這則訊息在講他自己。** B 訊息裡除了該玩家的身分欄位，還會帶別人的 `characterId`
+> 當參照。已知一例（使用者回報，尚無本地封包樣本佐證）：**自己是隊長時，新成員加入所送出的
+> 登場訊息裡帶著隊長的 `characterId`**。當隊員時不會發生——別人訊息裡帶的是隊長的 ID，不是自己的。
+
 ```
 characterId = accountInfo << 16 | characterIndex
 ```
@@ -85,6 +89,16 @@ characterId = accountInfo << 16 | characterIndex
 - 只比帳號碼 → 綁到同帳號的別隻角色
 - 只比角色索引 → 撞到別的帳號（索引 4、5 這種小數字滿地都是）
 
+### 同一場只綁第一個命中者
+
+A 訊息（換場景）一律解除綁定，所以**一場裡「自己」的實體 ID 不會變**。同場再冒出第二個
+帶著我 `characterId` 的實體，那必定是上面說的參照欄位，不是我。
+
+- 舊版是「後者覆蓋前者」，隊長開副本、中途有人加入隊伍就會把自己綁到新成員身上，整場傷害報廢
+- 現在：已綁定後再命中 → 拒絕改綁，只寫一行 `⚠ 忽略候選 0x…（位移 +…）` 到診斷 LOG
+- 唯一例外：治癒端學到的 `local_player_id`（獨立來源）指向新候選 → 才改綁
+- 代價：若 A 訊息漏收（重傳/亂序）而場景其實換了，舊綁定會卡住不放；診斷 LOG 的忽略行是唯一線索
+
 ### 換場景 / 換角色
 
 | 事件 | 訊號 | 動作 |
@@ -107,7 +121,8 @@ characterId = accountInfo << 16 | characterIndex
 | `_ident_open` / `_ident_feed` | 開一則訊息、把跨封包的 body 接續餵進串流解壓器 |
 | `_ident_apply_self` | A 訊息 → 身分；**一律解除舊綁定**、重置本場統計 |
 | `_ident_finish_appear` | B 訊息收尾 → 實體 ID + 比對 |
-| `_ident_match_offset` / `_ident_bind` | 搜 `characterId`、綁定並記 LOG |
+| `_ident_match_offsets` / `_ident_bind` | 搜出 `characterId` 的**所有**位移、綁定並記 LOG |
+| `_ident_reject_rebind` | 本場已綁定又有別的實體命中 → 拒絕改綁（見 §3） |
 | `_ident_rescan_cache` | A 晚到時回頭掃快取的 B |
 
 幾個關鍵設計，改動前先看懂：
@@ -123,7 +138,8 @@ characterId = accountInfo << 16 | characterIndex
 ## 5. 已知限制
 
 - **本工具不做 TCP 重組**。狀態機假設封包依序、連續；**重傳或亂序會直接打斷串流解壓**，該則訊息就丟掉（LOG 會記一行）。實測可用，但這是最脆弱的一環——若某次換場景一直綁不上，第一個懷疑這裡。
-- `characterId` 的位移不是常數，靠搜尋；理論上可能撞到別的欄位剛好等於同一個 u64（實測未發生，且 8 bytes 全等的機率極低）。
+- `characterId` 的位移不是常數，靠搜尋。**撞到「別人訊息裡的參照欄位」是實際會發生的事**（隊長 + 新成員加入，見 §2 B），
+  不是理論風險；靠「同一場只綁第一個」擋掉。撞到毫不相干的欄位剛好等於同一個 u64 則仍屬理論（8 bytes 全等，機率極低）。
 - 需要 `brotli`。**這是硬相依，不是選用的**：0x4FFF / 0x4E4F 都是 `enc=1`（Brotli），
   沒裝就完全無法偵測 —— 而 §9 的門檻會讓傷害統計連帶整個空白。
   安裝清單（`README.md`、`run-macos.sh`、`.github/workflows/build.yaml`）
