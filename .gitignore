@@ -10,6 +10,8 @@ RELEASE.marker
 .DS_Store
 CLAUDE.md
 Note/Ref/
+# 改版分析的工作筆記,只留在本機
+Note/0909MM封包更新.md
 Release/
 Save/
 version_info*.txt

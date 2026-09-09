@@ -8,16 +8,18 @@ macOS 上遊戲為 iOS App on Mac,流量直接走實體網卡,抓法與 Windows 
 
 打包說明 (實務上直接跑 MabinogiMobileScribe_BuildTool.bat / .sh,以下是等價的手動指令):
   怪物名對照表也要打包 —— 少了它目標欄位只能顯示 entityId 的 hex。
-  Windows 版一律加 --noupx:UPX 加殼會被 Defender 的 ML 啟發式判成
+  Windows 版是 onedir 且一律加 --noupx —— onefile 的「解壓到 %TEMP% 再載入 DLL」
+  與 UPX 加殼都是 Defender ML 啟發式的高權重特徵,會被判成
   Trojan:Win32/Wacatac.B!ml。BuildTool.bat 另外會用 make_version_file.py
-  產生 --version-file,補上空白的 exe metadata(同一個誤判的另一個成因)。
+  產生 --version-file,補上空白的 exe metadata(同一個誤判的第三個成因)。
 
   Windows 開發版 (顯示開發者選項):
-    python -m PyInstaller --onefile --noconsole --noupx --collect-data customtkinter --add-data "notice_monster_names_tw.json;." MabinogiMobileScribe_Beta.py
+    python -m PyInstaller --onedir --noconfirm --noconsole --noupx --collect-data customtkinter --add-data "notice_monster_names_tw.json;." MabinogiMobileScribe_Beta.py
 
   Windows 發布版 (隱藏開發者選項):
-    type nul > RELEASE.marker
-    python -m PyInstaller --onefile --noconsole --noupx --collect-data customtkinter --add-data "RELEASE.marker;." --add-data "notice_monster_names_tw.json;." MabinogiMobileScribe_Beta.py
+    走 MM_Scribe_Release.spec —— 主程式與圖表閱覽器共用一份 _internal,
+    這是命令列參數表達不了的,所以那份 spec 是版控裡的來源而非產物:
+    python -m PyInstaller --noconfirm MM_Scribe_Release.spec
 
   macOS (--add-data 分隔符是 ':' 不是 ';'):
     touch RELEASE.marker
@@ -152,8 +154,19 @@ MERGE_GROUP_SECTION = "合併群組"
 HEAL_SHIELD_SKILL_NEAR_WINDOW = 300  # Near 掃描單向視窗大小 (bytes)
 ALT_SKILL_MAX_GAP = 8                # 0x1ADE8 允許緊接 0x4EED 結束後的最大 gap
 ALT_SKILL_BACKSCAN = 64              # 往前找 0x4EED 的搜尋深度
+# 傷害事件 opcode — 2026-09-09 改版後伺服器重發 packet_type_config,整份目錄改號。
+# 標頭結構與欄位佈局完全沒變,只有 packetType 數值變了 (筆記 §2 第 3 點預測的情形)。
+# 驗證:1.37MB / 33223 則訊息以 9-byte 標頭鏈式解析覆蓋率 100%;0x5235 的
+#      attacker/target/dmg/flags offset 全部命中,技能 ID 解出「普攻」「魔力連結飛彈」。
+DMG_EVENT_TYPE = 0x5235           # CHANNEL_ShowDamageFloater_NTF (舊 0x51E9)
+DMG_EVENT_MAGIC = struct.pack("<I", DMG_EVENT_TYPE)
+SKILL_TLV_TYPE = 0x4FEC           # 技能 TLV,經典型 size 35 (舊 0x4FC5)
+SKILL_TLV_MAGIC = struct.pack("<I", SKILL_TLV_TYPE)
+# 0x4F40 與傷害事件同為 contentLength 53,但 attacker == target 且 dmg = 0 —— 就是
+# 筆記 §3 說的 decoy。opcode 不同所以正常掃描撞不到,parse_payload 仍照 protocol 的
+# 合法條件 (userId != targetId 且兩者皆非 0) 加一道守門,擋對錯位撞出來的假標頭。
 # 傷害旗標區 (見 MM_Scribe_PacketNotes_Damage.md §4)
-# 0x51E9 事件的旗標是連續 7 bytes: payload[offset+41 .. offset+47]
+# 0x5235 事件的旗標是連續 7 bytes: payload[offset+41 .. offset+47]
 #   flags[0] = b41 (已用), flags[1] = b42 (已用), flags[2..6] = b43..b47 (診斷中)
 DMG_FLAG_BASE = 41
 DMG_FLAG_LEN = 7
@@ -214,8 +227,8 @@ DMG_FLAG_CANDIDATES = (
 # **本工具不做 TCP 重組**,而 A 訊息壓縮後可達 170KB+、會跨上百個封包。
 # 這裡的做法是「串流解壓器邊收邊餵,只要吐得出前 8 bytes 就收工」——
 # 能不能成立取決於 brotli 在只收到開頭幾 KB 時肯不肯吐 output,**待實測**。
-IDENT_SELF_TYPE = 0x4FFF
-IDENT_APPEAR_TYPE = 0x4E4F
+IDENT_SELF_TYPE = 0x5028          # 2026-09-09 改版:舊 0x4FFF (解壓後佈局不變)
+IDENT_APPEAR_TYPE = 0x4E4F        # 改版後未變動 (實測仍是這個值)
 IDENT_SELF_MIN_SIZE = 1024        # A 訊息很大;太小的多半是對錯位撞出來的假標頭
 IDENT_SELF_FEED_MAX = 1 << 18     # 餵超過這麼多 bytes 還吐不出 8 bytes 就放棄本則
 IDENT_APPEAR_MIN_SIZE = 64        # B 訊息實測 1100~1300 bytes;放寬下限只擋明顯假的
@@ -277,7 +290,7 @@ MOB_HEAD_SENTINEL = b"\x03\x00\x00\x00"   # 前哨
 MOB_TAIL_SENTINEL = b"\x00\x00\x00\x00"   # 後哨
 # 掃到這三個一律當沒掃到,繼續往前找 (對照表裡確認過沒有這三個鍵)
 MOB_CODE_IGNORE = {"00000000", "01000000", "FFFFFFFF"}
-# ---- Buff 探針 (0x1ADE8 / 0x1ADEA / 0x1ADE9) — 開發者 LOG 觀測用,不進統計 ----
+# ---- Buff 探針 (0x1D4FD / 0x1D4FF / 0x1D4FE) — 開發者 LOG 觀測用,不進統計 ----
 # 見 Note/MM_Scribe_PacketNotes_Buff.md。四份離線樣本 (Note/Ref/Buff pcapng) 推導,
 # ADD/REM 的語意已由「宣告 8.0 秒 → 實際存活 8.01 秒」驗證。
 #
@@ -288,10 +301,10 @@ MOB_CODE_IGNORE = {"00000000", "01000000", "FFFFFFFF"}
 # 這三個 opcode 的 content 都是 enc=0 (未壓縮),不需要 brotli、也不必接續跨封包的
 # body —— 整則訊息只有 25/45 bytes,直接逐 payload 掃 magic 就好,不必像 _mob_walk
 # 那樣維護串流狀態。假標頭靠「opcode + 長度完全相符 + enc==0」三重守門擋掉。
-# opcode 是「今天台版的值」,會隨改版變動 (與 0x51E9 / 0x4E4C 同樣風險)。
-BUFF_ADD_TYPE = 0x1ADE8           # REPLICATION_ActorBuff_Add_REPL
-BUFF_UPD_TYPE = 0x1ADEA           # 更新 (同 key/buffId/秒數,只有 c 欄變)
-BUFF_REM_TYPE = 0x1ADE9           # 移除 / 到期
+# opcode 是「今天台版的值」,會隨改版變動 (與 0x5235 / 0x4E4C 同樣風險)。
+BUFF_ADD_TYPE = 0x1D4FD           # REPLICATION_ActorBuff_Add_REPL
+BUFF_UPD_TYPE = 0x1D4FF           # 更新 (同 key/buffId/秒數,只有 c 欄變)
+BUFF_REM_TYPE = 0x1D4FE           # 移除 / 到期
 # {packetType: (magic, content 長度, 顯示名)} — 長度必須完全相符才採信
 BUFF_OPS = {
     BUFF_ADD_TYPE: (struct.pack("<I", BUFF_ADD_TYPE), 36, "ADD"),
@@ -3717,14 +3730,14 @@ class LiveDamageMonitor:
     # 封包解析
     # ================================================
     def find_skill_id_after(self, payload, start):
-        """在 start offset 後方(200 bytes 內)尋找 0x4fc5 TLV, 回傳其 skill_id。
+        """在 start offset 後方(200 bytes 內)尋找 0x4FEC TLV, 回傳其 skill_id。
         參考 MM_Scribe_PacketNotes.md §5: skill_id 位於該 block payload offset 17..20。
         """
         payload_len = len(payload)
         limit = min(start + 200, payload_len - 8)
         scan = start
         while scan < limit:
-            if payload[scan:scan+4] == b'\xc5\x4f\x00\x00':
+            if payload[scan:scan+4] == SKILL_TLV_MAGIC:
                 try:
                     sz = struct.unpack("<I", payload[scan+4:scan+8])[0]
                     if sz == 35 and scan + 8 + 21 <= payload_len:
@@ -4313,7 +4326,7 @@ class LiveDamageMonitor:
         return None
 
     # ------------------------------------------------------------------
-    # Buff 探針 (0x1ADE8 / 0x1ADEA / 0x1ADE9) — 純觀測,只寫診斷 LOG
+    # Buff 探針 (0x1D4FD / 0x1D4FF / 0x1D4FE) — 純觀測,只寫診斷 LOG
     #   _buff_reset   清狀態 (每次重建視窗)
     #   _buff_scan    每個封包的入口,任何例外都不得影響其他解析
     # 佈局與驗證過程見 Note/MM_Scribe_PacketNotes_Buff.md
@@ -4501,7 +4514,7 @@ class LiveDamageMonitor:
         payload_len = len(payload)
 
         while offset < payload_len - 4:
-            if payload[offset:offset+4] == b'\xe9\x51\x00\x00':
+            if payload[offset:offset+4] == DMG_EVENT_MAGIC:
                 try:
                     size = struct.unpack("<I", payload[offset+4:offset+8])[0]
 
@@ -4513,6 +4526,13 @@ class LiveDamageMonitor:
                         # 攻擊者 ID (protocol: UInt32 userId @ content+0 = offset+9);
                         # offset+55 的長度守門已涵蓋 offset+9..13
                         attacker_id = struct.unpack("<I", payload[offset+9:offset+13])[0]
+                        # anti-decoy (筆記 §3):protocol 規定 ShowDamageFloater 的
+                        # 合法條件是 userId != targetId 且兩者皆非 0。attacker == target
+                        # 的對齊是誘餌 (改版後的 0x4F40 整族都是這樣),一律跳過不計。
+                        if (attacker_id == target_id
+                                or attacker_id == 0 or target_id == 0):
+                            offset += (size + 8) if size > 0 else 35
+                            continue
                         # 統計門檻:沒認出自己的實體 ID 就完全不記錄,認出後也只記
                         # 「攻擊者 == 自己」的傷害 (見 _scan_identity / 身分筆記)。
                         # 勾了「⚡ 強制偵測」就整個旁路,全部收 (見 toggle_force_all)。
@@ -4548,7 +4568,7 @@ class LiveDamageMonitor:
                         is_sustain = (not is_dot) and all(
                             flags[idx] & mask for idx, mask in DMG_SUSTAIN_BITS)
 
-                        # 嘗試從後續的 0x4fc5 TLV 抽出 skill_id (可能為 None)
+                        # 嘗試從後續的 0x4FEC TLV 抽出 skill_id (可能為 None)
                         # 事件實際總長為 9 + size (標頭含 encodingType),這裡刻意用 +8 起掃:
                         # 起點早 1 byte 只是多掃一輪,起點晚 1 byte 會直接跳過 magic。
                         skill_id = self.find_skill_id_after(payload, offset + 8 + size)
@@ -4923,8 +4943,8 @@ class LiveDamageMonitor:
             size = struct.unpack("<I", payload[magic_off+4:magic_off+8])[0]
         except Exception:
             return None
-        # 經典型 0x4FC5 size 35 — 無條件接受
-        if cmd == b'\xc5\x4f\x00\x00' and size == 35:
+        # 經典型 0x4FEC size 35 — 無條件接受
+        if cmd == SKILL_TLV_MAGIC and size == 35:
             if magic_off + 29 <= payload_len:
                 try:
                     return (struct.unpack("<I", payload[magic_off+25:magic_off+29])[0],
@@ -4932,6 +4952,8 @@ class LiveDamageMonitor:
                 except Exception:
                     return None
         # 替代型 0x1ADE8 size 36 — 需 anti-decoy 檢查
+        # ⚠ 2026-09-09 改版:這裡的 0x1ADE8 與 anti-decoy 依據的 0x4EED 都還沒對出
+        #   新值 (治癒/護盾樣本尚未錄到),因此這條分支目前等同停用。錄到樣本再更新。
         if cmd == b'\xe8\xad\x01\x00' and size == 36:
             if magic_off + 29 <= payload_len:
                 try:
