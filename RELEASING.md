@@ -144,7 +144,8 @@ tag 已存在時腳本**不會代為刪除**，只印出手動刪除的指令 �
 3. 到 Actions 看 [build.yaml](.github/workflows/build.yaml) 的兩個 job —— macOS 與
    Windows 並行建置（約數分鐘），完成後 `MMScribe.*.macOS.zip` 與
    `MMScribe.*.Windows.zip` 都會自動掛到 draft release。
-   Windows zip 內含 Release 版 `MM Scribe.exe` 與預設的 `settings.ini`、`skills.ini`
+   Windows zip 內是一個 `MM Scribe` 資料夾（onedir），內含 Release 版 `MM Scribe.exe`、
+   圖表閱覽器、共用的 `_internal`，以及預設的 `settings.ini`、`skills.ini`、`effects.ini`
 4. 回到 draft release 寫發版說明，按 Publish
 
 兩個平台都已自動化；某個 job 失敗時可在 Actions 頁面單獨重跑該 job，

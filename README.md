@@ -58,6 +58,25 @@
 
 ---
 
+## Windows 使用說明
+
+解壓後會得到一個 `MM Scribe` 資料夾：
+
+```
+MM Scribe/
+├── MM Scribe.exe          ← 主程式，雙擊執行
+├── MM Scribe Graph.exe    ← 圖表閱覽器
+├── settings.ini / skills.ini / effects.ini
+└── _internal/             ← 程式的相依檔案，不要搬動或刪除
+```
+
+**請整個資料夾一起搬移。** 只把 `MM Scribe.exe` 拉到桌面會因為找不到 `_internal` 而無法啟動；
+想在桌面開啟請對 exe 按右鍵選「建立捷徑」，再把捷徑拉出去。
+
+執行需要**系統管理員權限**（scapy 抓包的必要條件），並先安裝 [Npcap](https://npcap.com/)。
+
+---
+
 ## macOS 使用說明
 
 ### 1. 解除 Apple 的安全性阻擋
@@ -190,18 +209,29 @@ popout_skill = false           ; 技能傷害排行獨立視窗
 
 ### Windows
 
+實務上直接跑 [MabinogiMobileScribe_BuildTool.bat](Source/MabinogiMobileScribe_BuildTool.bat)，
+它會建出開發版，再依 [MM_Scribe_Release.spec](Source/MM_Scribe_Release.spec) 把發布版與圖表閱覽器
+打包進同一個共用資料夾。
+
+Windows 版採 **onedir**（不是單一 exe）。onefile 每次執行都要把整包解到 `%TEMP%` 下的
+`_MEIxxxx` 再從那裡載入 DLL，那是 Defender ML 啟發式的高權重特徵，會被判成
+`Trojan:Win32/Wacatac.B!ml`。同樣理由，所有建置都加 `--noupx`，並用
+[make_version_file.py](Source/make_version_file.py) 補上 exe 的版本資源。
+
 **開發版**（顯示開發者選項）：
 
 ```bash
-python -m PyInstaller --onefile --noconsole --collect-data customtkinter MabinogiMobileScribe_Beta.py
+python -m PyInstaller --onedir --noconfirm --noconsole --noupx --collect-data customtkinter MabinogiMobileScribe_Beta.py
 ```
 
-**發布版**（隱藏開發者選項）：
+**發布版**（隱藏開發者選項、與圖表閱覽器共用 `_internal`）：
 
 ```bash
-type nul > RELEASE.marker
-python -m PyInstaller --onefile --noconsole --collect-data customtkinter --add-data "RELEASE.marker;." --add-data "notice_monster_names_tw.json;." MabinogiMobileScribe_Beta.py
+python -m PyInstaller --noconfirm MM_Scribe_Release.spec
 ```
+
+發布版的設定寫在 spec 而非命令列 —— 「一個 `COLLECT` 同時收兩個 `EXE`」是命令列參數
+表達不了的，而那正是兩支程式共用一份 Python runtime、不讓 zip 大一倍的關鍵。
 
 ### macOS
 

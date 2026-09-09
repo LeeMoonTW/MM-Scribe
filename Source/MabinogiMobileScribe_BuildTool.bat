@@ -26,10 +26,20 @@ if not defined SCRIPT (
 echo Detected source: %SCRIPT%
 
 REM ---- Graph viewer (optional): built only if the source is present ----
-set "GRAPH="
-if exist "MabinogiMobileScribeGraph_Beta.py" set "GRAPH=MabinogiMobileScribeGraph_Beta.py"
-if defined GRAPH     echo Detected graph : %GRAPH%
-if not defined GRAPH echo Detected graph : none - skipping graph build
+set "GRAPH=MabinogiMobileScribeGraph_Beta.py"
+if not exist "%GRAPH%" (
+    echo [ERROR] Cannot find %GRAPH%.
+    echo         The release build packs both programs into ONE shared folder,
+    echo         so the graph source is no longer optional. See MM_Scribe_Release.spec.
+    pause
+    exit /b 1
+)
+if not exist "MM_Scribe_Release.spec" (
+    echo [ERROR] Cannot find MM_Scribe_Release.spec - it is tracked in git, not generated.
+    pause
+    exit /b 1
+)
+echo Detected graph : %GRAPH%
 echo.
 
 REM ---- Auto-detect icon files. Use set "VAR=..." form to avoid trailing spaces ----
@@ -62,17 +72,22 @@ if not defined ICON_REL echo Icon for Release : none - using default
 echo.
 
 REM ---- Clean previous build artifacts so PyInstaller does not reuse cached spec ----
+REM      Only the specs PyInstaller GENERATES from command-line flags are deleted.
+REM      MM_Scribe_Release.spec is hand-written and tracked in git - the underscore
+REM      name keeps it out of the "MM Scribe*.spec" pattern below on purpose.
 if exist "build" rmdir /s /q "build" >nul 2>&1
 if exist "MM Scribe.spec" del "MM Scribe.spec" >nul 2>&1
 if exist "MM Scribe Dev.spec" del "MM Scribe Dev.spec" >nul 2>&1
 if exist "MM Scribe Graph.spec" del "MM Scribe Graph.spec" >nul 2>&1
 
 echo ============================================================
-echo  Step 1/4 : Build DEV version (with developer options)
+echo  Step 1/3 : Build DEV version (with developer options)
 echo ============================================================
-call :mkversion "MM Scribe Dev.exe" "MM Scribe Dev"
+REM  Dev stays on its own folder - it differs from Release only by RELEASE.marker,
+REM  so sharing one output folder with Release would make them overwrite each other.
+call :mkversion version_info.txt "MM Scribe Dev.exe" "MM Scribe Dev"
 if errorlevel 1 goto :error
-python -m PyInstaller --onefile --noconsole --noupx ^
+python -m PyInstaller --onedir --noconfirm --noconsole --noupx ^
     --version-file=version_info.txt ^
     --collect-data customtkinter ^
     %ICON_DEV% ^
@@ -84,70 +99,54 @@ if errorlevel 1 goto :error
 
 echo.
 echo ============================================================
-echo  Step 2/4 : Create release marker
+echo  Step 2/3 : Prepare release inputs
 echo ============================================================
+REM  Release marker: the program hides the developer options when this is bundled.
 type nul > RELEASE.marker
 echo Marker created.
 
-echo.
-echo ============================================================
-echo  Step 3/4 : Build RELEASE version (developer options hidden)
-echo ============================================================
-call :mkversion "MM Scribe.exe" "MM Scribe"
-if errorlevel 1 goto :error
-python -m PyInstaller --onefile --noconsole --noupx ^
-    --version-file=version_info.txt ^
-    --collect-data customtkinter ^
-    --add-data "RELEASE.marker;." ^
-    %ICON_REL% ^
-    %ADD_ICON_REL% ^
-    %ADD_MOBNAMES% ^
-    --name "MM Scribe" ^
-    "%SCRIPT%"
-if errorlevel 1 goto :error
-
-REM ---- Cleanup: remove temporary marker ----
-del RELEASE.marker >nul 2>&1
-
-echo.
-echo ============================================================
-echo  Step 4/4 : Build Graph viewer (no Dev variant needed)
-echo ============================================================
-if not defined GRAPH (
-    echo Skipped - graph source not found.
-    goto :done
-)
-
-REM  Version follows the main program's VERSION_STR. The graph reads it from the
-REM  source next door, so importing it here gives the same single source of truth;
-REM  PyInstaller bundles the result so the packed EXE knows its version too.
+REM  Graph version follows the main program's VERSION_STR. Delete any stale
+REM  VERSION.txt first - the graph module reads it back when present, which would
+REM  otherwise pin the version to whatever the previous build wrote.
+if exist VERSION.txt del VERSION.txt >nul 2>&1
 python -c "import MabinogiMobileScribeGraph_Beta as g;open('VERSION.txt','w').write(g.VERSION_STR)"
 if errorlevel 1 goto :error
 set /p GRAPH_VER=<VERSION.txt
 echo Graph version : %GRAPH_VER%
 
-call :mkversion "MM Scribe Graph.exe" "MM Scribe Graph"
+REM  One version resource per exe - they differ in product / original filename.
+call :mkversion version_info_main.txt "MM Scribe.exe" "MM Scribe"
 if errorlevel 1 goto :error
-python -m PyInstaller --onefile --noconsole --noupx ^
-    --version-file=version_info.txt ^
-    --collect-data customtkinter ^
-    --add-data "VERSION.txt;." ^
-    %ICON_REL% ^
-    %ADD_ICON_REL% ^
-    --name "MM Scribe Graph" ^
-    "%GRAPH%"
+call :mkversion version_info_graph.txt "MM Scribe Graph.exe" "MM Scribe Graph"
 if errorlevel 1 goto :error
+
+echo.
+echo ============================================================
+echo  Step 3/3 : Build RELEASE + Graph into one shared folder
+echo ============================================================
+REM  Driven by the hand-written spec: one COLLECT holding both EXEs, so the
+REM  Python runtime / tk / PIL are shipped once instead of twice. Command-line
+REM  build options are IGNORED when a spec is given - everything lives in the
+REM  spec (upx=False, version=..., icon, bundled data).
+python -m PyInstaller --noconfirm MM_Scribe_Release.spec
+if errorlevel 1 goto :error
+
+REM ---- Cleanup: remove temporary build inputs ----
+del RELEASE.marker >nul 2>&1
 del VERSION.txt >nul 2>&1
 
-:done
 echo.
 echo ============================================================
 echo  DONE!
-echo    Dev     : dist\MM Scribe Dev.exe
-echo    Release : dist\MM Scribe.exe
-if defined GRAPH echo    Graph   : dist\MM Scribe Graph.exe
+echo    Dev     : dist\MM Scribe Dev\MM Scribe Dev.exe
+echo    Release : dist\MM Scribe\MM Scribe.exe
+echo    Graph   : dist\MM Scribe\MM Scribe Graph.exe
+echo.
+echo  Release and Graph share dist\MM Scribe\_internal - ship the WHOLE folder.
 echo ============================================================
 if exist version_info.txt del version_info.txt >nul 2>&1
+if exist version_info_main.txt del version_info_main.txt >nul 2>&1
+if exist version_info_graph.txt del version_info_graph.txt >nul 2>&1
 pause
 exit /b 0
 
@@ -159,11 +158,13 @@ echo ============================================================
 if exist RELEASE.marker del RELEASE.marker >nul 2>&1
 if exist VERSION.txt del VERSION.txt >nul 2>&1
 if exist version_info.txt del version_info.txt >nul 2>&1
+if exist version_info_main.txt del version_info_main.txt >nul 2>&1
+if exist version_info_graph.txt del version_info_graph.txt >nul 2>&1
 pause
 exit /b 1
 
 REM ============================================================
-REM  :mkversion <exe filename> <product name>
+REM  :mkversion <output file> <exe filename> <product name>
 REM
 REM  Writes the PE version resource consumed by --version-file above.
 REM  An exe with blank metadata (no company / product / copyright) scores badly
@@ -172,5 +173,5 @@ REM  zip flagged as Trojan:Win32/Wacatac.B!ml, hence --noupx on every build too.
 REM  Version numbers come from the main program's VERSION_STR, as everywhere else.
 REM ============================================================
 :mkversion
-python make_version_file.py version_info.txt %1 %2
+python make_version_file.py %1 %2 %3
 exit /b %errorlevel%

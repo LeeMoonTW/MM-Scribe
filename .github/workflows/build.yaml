@@ -142,8 +142,10 @@ jobs:
         run: MabinogiMobileScribe_BuildTool.bat < NUL
 
       # 只發布 Release 版(與 macOS 只包 .app 同理);Dev exe 留在 artifact 之外。
-      # 圖表閱覽器 (MM Scribe Graph.exe) 沒有 Dev/Release 之分,直接收進來。
-      # zip 內附預設定檔,使用者解壓即有 skills.ini / settings.ini / effects.ini 可直接修改。
+      # Windows 版改成 onedir 後,主程式與圖表閱覽器共用同一個 dist\MM Scribe\_internal
+      # (見 MM_Scribe_Release.spec),所以打包的是整個資料夾,不再是零散的 exe。
+      # zip 內附預設定檔,使用者解壓即有 skills.ini / settings.ini / effects.ini 可直接修改;
+      # 這幾個檔要放在 exe 同層 —— get_external_path 找的是 dirname(sys.executable)。
       # 原始碼檔名不再帶版號(見 RELEASING.md),所以版號讀 VERSION_STR。
       # 檔名格式對照 macOS zip:MMScribe.Beta.V0.52.Windows.zip
       - name: 壓縮 Release 版
@@ -169,13 +171,20 @@ jobs:
           }
 
           $NAME = "MMScribe.$($VER -replace ' ', '.').Windows.zip"
-          $items = @("MM Scribe.exe", "..\settings.ini", "..\skills.ini", "..\effects.ini")
-          if (Test-Path "MM Scribe Graph.exe") {
-            $items += "MM Scribe Graph.exe"
-          } else {
+
+          # BuildTool.bat 在 errorlevel 下會 goto :error,但 CI 是用管線串起來的,
+          # 產物檢查放這裡才擋得住「建置沒出東西卻繼續打包出一個空 zip」。
+          $app = "MM Scribe"
+          if (-not (Test-Path "$app\MM Scribe.exe")) {
+            Write-Host "::error::建置沒有產出 $app\MM Scribe.exe — 上一步的 BuildTool.bat 可能提早中止"
+            Get-ChildItem | Select-Object -ExpandProperty Name | Write-Host
+            exit 1
+          }
+          if (-not (Test-Path "$app\MM Scribe Graph.exe")) {
             Write-Host "::warning::找不到 MM Scribe Graph.exe,zip 內不含圖表閱覽器"
           }
-          Compress-Archive -Path $items -DestinationPath $NAME -Force
+          Copy-Item ..\settings.ini, ..\skills.ini, ..\effects.ini $app
+          Compress-Archive -Path $app -DestinationPath $NAME -Force
           Add-Content -Path $env:GITHUB_ENV -Value "ZIP_NAME=$NAME"
           Get-Item $NAME
 

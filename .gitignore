@@ -4,10 +4,12 @@ __pycache__/
 build/
 dist/
 *.spec
+# 例外:發布版的 spec 是手寫來源(共用 _internal 的設定寫不進命令列參數)
+!Source/MM_Scribe_Release.spec
 RELEASE.marker
 .DS_Store
 CLAUDE.md
 Note/Ref/
 Release/
 Save/
-version_info.txt
+version_info*.txt
