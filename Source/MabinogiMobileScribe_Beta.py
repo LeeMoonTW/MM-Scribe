@@ -124,9 +124,12 @@ LOG_HISTORY_MAX = 5000
 DMG_EVENT_TAG_BITS = ("爆擊", "強擊", "破防", "無防備",
                       "連擊", "多重打擊", "迎擊", "追擊",
                       "延長破防", "終結")
-# DoT / 間接固定放在高位,中間留空檔 — 標籤再加也不會撞到這兩個位元
+# DoT / 間接 / 連攜固定放在高位,中間留空檔 — 標籤再加也不會撞到這幾個位元
 DMG_EVENT_DOT_BIT = 1 << 16
 DMG_EVENT_SUSTAIN_BIT = 1 << 17
+# 連攜 (技能是隊友放的,傷害掛在自己身上):這種事件不進統計桶,只留在時間序列裡,
+# 所以位元一定要寫進存檔 —— 否則事後看存檔會發現事件總和對不上統計總傷害。
+DMG_EVENT_CHAIN_BIT = 1 << 18
 # 時間序列保留筆數上限 (deque,超量自動丟最舊的)
 DMG_EVENT_MAX = 100000
 SKILL_CFG_NAME = "skills.ini"
@@ -198,6 +201,24 @@ DMG_EXTRA_BIT_LABELS = ((1, 0x08, "42.08"), (1, 0x80, "42.80"), (2, 0x01, "43.01
 # 追擊 (add_hit_flag) — 位置來自 packet-protocol.md, 本地尚未錄到樣本驗證。
 # 已納入正式標籤與覆蓋率統計; 若實測發現誤判, 只要改這一組常數即可。
 DMG_ADD_HIT_BIT = (3, 0x08)
+# ---- 0x5235 <-> 0x4FEC 配對 (2026-09-11 實機錄包實測,見筆記 §5.1) ----
+# 舊作法「往後掃 200 bytes 抓第一個 0x4FEC」是錯的。實測 5557 封包 / 289 筆傷害:
+#   * 施法者 == 傷害事件的攻擊者 (自己動手打的) → DMG 在前、SKILL 在後   100/100 筆
+#   * 連攜觸發 (治癒師 1 技光波之類)          → SKILL 在前、DMG 在後   184/189 筆
+# 所以只能雙向掃。配對鍵也不能用 attacker —— 連攜時 SKILL 的 userId 是「放技能
+# 的那個隊友」,DMG 的 userId 是「被掛連結的自己」,兩邊本來就不同。
+# 實測可零歧義配對的鍵是:目標 ID 相同 + 7 bytes 旗標全等 → 289/289 筆全中。
+DMG_EVENT_SIZE = 53            # 0x5235 的 contentLength;非此值視為假標頭
+DMG_SKILL_NEAR_WINDOW = 400    # 雙向掃描視窗 (實測 SKILL 最遠落在 171 bytes 外)
+SKILL_TLV_FLAG_BASE = 33       # 0x4FEC 內旗標起點 (content+24),對應 DMG 的 +41
+DMG_CHAIN_SUFFIX = "(連攜)"    # SKILL.userId != DMG.userId → 別人掛在你身上觸發的
+# ---- TCP 位元組接續 (2026-09-11 實測) ----
+# 289 筆傷害事件裡有 16 筆 (5.5%) 被切在 TCP segment 邊界上,逐封包掃會整筆漏掉
+# (筆記 §2「被切中機率低」的推測與實測不符)。這裡不做完整 TCP stack,只做同一
+# 連線的位元組接續:seq 接得上就把上一包的尾巴續上,亂序/丟包就丟掉重來。
+DMG_STREAM_CARRY = 1024        # 每條連線保留的尾端位元組數 (需 > 視窗+事件長)
+DMG_STREAM_MAX_CONNS = 8       # 同時追蹤的連線數上限
+DMG_PAIR_FLUSH_SEC = 0.25      # 事件後方資料還沒到齊時最多等多久,逾時就照現況判
 # 以下位元語意來自第三方整理的 packet-protocol.md, 尚未用本地樣本驗證,
 # 目前「只在開發者模式顯示」, 不進入正式標籤 / 統計。
 # 格式: (flags index, mask, 顯示名稱)
@@ -262,6 +283,16 @@ DEV_STRIP_EMPTY = "🛠 診斷 LOG — 尚無訊息  (點擊展開)"
 DEV_TAG_MARKS = (("✗", "dev_err"), ("⚠", "dev_warn"), ("★", "dev_ok"))
 DEV_TAG_COLORS = {"dev_err": "#ff5555", "dev_warn": "#ffcc4d", "dev_ok": "#4dd471"}
 DEV_STRIP_IDLE_COLOR = "#888888"      # 底部單行沒有標記時的灰
+# 展開視窗上方的分類過濾:訊息開頭的 [XXX] 決定它屬於哪一類。
+# (設定鍵, 勾選標題, 訊息前綴) — 前綴要和各 _*_note/_*_log 寫出去的字串對得上。
+# 沒有前綴的訊息 (啟動提示、brotli 警告等) 不歸類,永遠顯示。
+DEV_CATEGORIES = (
+    ("dmg", "傷害", "[Flag]"),
+    ("buff", "BUFF", "[BUFF]"),
+    ("mob", "敵人ID", "[MOB]"),
+    ("id", "角色ID", "[ID]"),
+)
+DEV_PREFIX_CAT = {prefix: key for key, _, prefix in DEV_CATEGORIES}
 IDENT_SELF_MAGIC = struct.pack("<I", IDENT_SELF_TYPE)
 IDENT_APPEAR_MAGIC = struct.pack("<I", IDENT_APPEAR_TYPE)
 # ---- 怪物登場包探針 (0x4E4C) — 開發者 LOG 觀測用,不進統計 ----
@@ -586,8 +617,12 @@ def load_settings():
         "font_scale": FONT_SCALE_DEFAULT,
         "track_damage": True,
         "track_heal": False,
+        # 連攜攻擊偵測 (見 DMG_CHAIN_SUFFIX):預設關閉 = 連攜傷害整筆剔除
+        "detect_chain": False,
         "popout_log": False,
         "popout_skill": False,
+        # 診斷 LOG 展開視窗的分類過濾 (dev_filter_<key>);預設全開
+        **{f"dev_filter_{key}": True for key, _, _ in DEV_CATEGORIES},
         # 代理模式偵測要比對的遊戲執行檔名 (見 detect_local_game_proxy)。
         # 官方哪天改檔名時,使用者自己改 ini 就能救,不必等新版 exe。
         "game_processes": DEFAULT_GAME_PROCESSES,
@@ -618,6 +653,11 @@ def load_settings():
     except (ValueError, configparser.Error):
         pass
     try:
+        result["detect_chain"] = parser.getboolean(
+            "Tracking", "detect_chain", fallback=False)
+    except (ValueError, configparser.Error):
+        pass
+    try:
         result["popout_log"] = parser.getboolean("Layout", "popout_log", fallback=False)
     except (ValueError, configparser.Error):
         pass
@@ -625,6 +665,12 @@ def load_settings():
         result["popout_skill"] = parser.getboolean("Layout", "popout_skill", fallback=False)
     except (ValueError, configparser.Error):
         pass
+    for key, _, _ in DEV_CATEGORIES:
+        try:
+            result[f"dev_filter_{key}"] = parser.getboolean(
+                "DevLog", f"filter_{key}", fallback=True)
+        except (ValueError, configparser.Error):
+            pass
     try:
         raw = parser.get("Network", "game_processes",
                          fallback=",".join(DEFAULT_GAME_PROCESSES))
@@ -647,10 +693,15 @@ def save_settings(settings):
     parser["Tracking"] = {
         "track_damage": "true" if settings.get("track_damage", True) else "false",
         "track_heal": "true" if settings.get("track_heal", False) else "false",
+        "detect_chain": "true" if settings.get("detect_chain", False) else "false",
     }
     parser["Layout"] = {
         "popout_log": "true" if settings.get("popout_log", False) else "false",
         "popout_skill": "true" if settings.get("popout_skill", False) else "false",
+    }
+    parser["DevLog"] = {
+        f"filter_{key}": "true" if settings.get(f"dev_filter_{key}", True) else "false"
+        for key, _, _ in DEV_CATEGORIES
     }
     # 這裡是整檔覆寫,不寫回去的話使用者手改的行程名會被下一次存檔洗掉
     parser["Network"] = {
@@ -857,7 +908,7 @@ def _is_never_game_traffic(name):
     return str(name).startswith(_SKIP_IFACE_PREFIXES)
 
 
-def dmg_event_flags(tags, is_dot, is_sustain):
+def dmg_event_flags(tags, is_dot, is_sustain, is_chain=False):
     """把標籤列表壓成一個整數位元遮罩 (見 DMG_EVENT_TAG_BITS)。
     未知(...) 這種動態標籤不進遮罩 — 位元位置必須是固定語意,日後圖表才讀得懂。
     """
@@ -869,7 +920,17 @@ def dmg_event_flags(tags, is_dot, is_sustain):
         bits |= DMG_EVENT_DOT_BIT
     if is_sustain:
         bits |= DMG_EVENT_SUSTAIN_BIT
+    if is_chain:
+        bits |= DMG_EVENT_CHAIN_BIT
     return bits
+
+
+def seq_before(a, b):
+    """TCP seq 比較:a 是否排在 b 之前 (32-bit 環繞安全,RFC 1982 的作法)。
+
+    直接用 `<` 在 seq 繞過 0xFFFFFFFF 時會整個反過來。長連線跑幾小時就會踩到。
+    """
+    return a != b and ((b - a) & 0xFFFFFFFF) < 0x80000000
 
 
 IP_FILTER_NET = "43.0.0.0/8"
@@ -1041,6 +1102,8 @@ class LiveDamageMonitor:
         # 狀態變數
         self.is_monitoring = False
         self.sniff_thread = None
+        # 傷害解析的 TCP 接續狀態 (見 _dmg_feed);conn_key → 該連線的緩衝與進度
+        self._dmg_streams = collections.OrderedDict()
         self.is_topmost = False
         # 診斷 LOG 現在是常駐區塊,沒有開關;發布版沒有 UI 入口就別花時間組字串
         self.is_dev_mode = not RELEASE_BUILD
@@ -1121,8 +1184,10 @@ class LiveDamageMonitor:
         # 追蹤模式旗標 (由 settings 載入,可從設定畫面切換)
         self.track_damage = self.settings["track_damage"]
         self.track_heal = self.settings["track_heal"]
+        self.detect_chain = self.settings["detect_chain"]
         self.track_damage_var = tk.BooleanVar(value=self.track_damage)
         self.track_heal_var = tk.BooleanVar(value=self.track_heal)
+        self.detect_chain_var = tk.BooleanVar(value=self.detect_chain)
 
         # Popout 旗標 (獨立視窗顯示攻擊日誌 / 技能排行)
         # popout_log_win / popout_skill_win: Toplevel 或 None
@@ -1135,8 +1200,13 @@ class LiveDamageMonitor:
         # 診斷 LOG 展開視窗:一律獨立 Toplevel (底部區塊點一下才開)
         self._dev_popout_win = None
         # 診斷 LOG 緩衝:底部區塊與展開視窗都從這裡取內容 (見 dev_log)
-        # 每筆存 (文字, 顏色 tag);tag 為 None = 一般灰字
+        # 每筆存 (文字, 顏色 tag, 分類 key);tag 為 None = 一般灰字,分類 None = 不歸類
         self._dev_lines = collections.deque(maxlen=DEV_LOG_MAX)
+        # 分類過濾只影響「展開視窗顯示哪幾行」,緩衝一律照收 —— 事後把某類打開
+        # 也看得到先前的訊息,不必重跑一場
+        self._dev_filter = {key: bool(self.settings[f"dev_filter_{key}"])
+                            for key, _, _ in DEV_CATEGORIES}
+        self._dev_filter_vars = {}
 
         # 提前建立 collapse 狀態與 merge_var,讓 pane 重建 (dock/popout) 時值可延續
         self.log_collapsed = False
@@ -1596,6 +1666,8 @@ class LiveDamageMonitor:
         self.log_area._textbox.tag_config("highlight", foreground="#ff4d4d")
         # 角色 ID 狀態列:取得後綠字 (未取得走 highlight 紅字)
         self.log_area._textbox.tag_config("ident_ok", foreground="#4dd471")
+        # 連攜傷害 (技能是隊友放的,傷害掛在自己身上):黃字
+        self.log_area._textbox.tag_config("chain", foreground="#ffcc4d")
         self.log_area._textbox.configure(tabs=self._scaled_tab_stops())
         self.log_area.configure(state="disabled")
         return self.log_pane
@@ -1789,8 +1861,18 @@ class LiveDamageMonitor:
     def _build_dev_pane(self, parent):
         """建立診斷 LOG 面板 (只會被 _popout_dev 呼叫,parent 恆為 Toplevel)。"""
         self.dev_pane = ctk.CTkFrame(parent, corner_radius=0)
-        ctk.CTkLabel(self.dev_pane, text="🛠 診斷 LOG",
-                     font=(FONT_UI, 11)).pack(anchor="w", padx=10, pady=(6, 0))
+        head = ctk.CTkFrame(self.dev_pane, fg_color="transparent")
+        head.pack(fill="x", padx=10, pady=(6, 0))
+        ctk.CTkLabel(head, text="🛠 診斷 LOG", font=(FONT_UI, 11)).pack(side="left")
+        # 分類勾選:取消勾選只是不顯示,緩衝照收 (見 _dev_render_all)
+        self._dev_filter_vars = {}
+        for key, title, _ in DEV_CATEGORIES:
+            var = tk.BooleanVar(value=self._dev_filter.get(key, True))
+            self._dev_filter_vars[key] = var
+            ctk.CTkCheckBox(head, text=title, variable=var, font=(FONT_UI, 11),
+                            checkbox_width=16, checkbox_height=16,
+                            command=lambda k=key: self._on_dev_filter_change(k)
+                            ).pack(side="left", padx=(12, 0))
         # 診斷行很長 (flags 7 bytes + 技能 + DoT + 候選),用 none 不折行,靠橫向捲軸看完整
         self.dev_log_area = ctk.CTkTextbox(self.dev_pane, wrap="none", font=(FONT_MONO, 12),
                                            corner_radius=0)
@@ -1820,19 +1902,45 @@ class LiveDamageMonitor:
         self._dev_popout_win = win
         self._build_dev_pane(win)
         self.dev_pane.pack(fill="both", expand=True, padx=6, pady=6)
-        if self._dev_lines:
-            # 一次 insert 全文再用行號補 tag (逐行 insert 數百筆會卡,同 _render_log)
-            self.dev_log_area.configure(state="normal")
-            self.dev_log_area.insert("1.0",
-                                     "\n".join(t for t, _ in self._dev_lines) + "\n")
-            box = self.dev_log_area._textbox
-            for row, (_, tag) in enumerate(self._dev_lines, start=1):
-                if tag:
-                    box.tag_add(tag, f"{row}.0", f"{row}.end+1c")
-            self.dev_log_area.see("end")
-            self.dev_log_area.configure(state="disabled")
+        # 剛開窗時捲到最新一行;之後新訊息不再強拉 (見 dev_log)
+        self._dev_render_all(scroll_end=True)
         # 主視窗如果目前是置頂,新開的 popout 也要一起置頂
         self._apply_topmost_all()
+
+    def _dev_visible(self, cat):
+        """cat 為 None (不歸類的訊息) 一律顯示。"""
+        return cat is None or self._dev_filter.get(cat, True)
+
+    def _dev_render_all(self, scroll_end=False):
+        """依目前的分類勾選重畫整個診斷視窗 (內容取自 _dev_lines)。
+
+        scroll_end=False 時維持原本的捲動位置 —— 使用者往上翻看舊訊息時
+        切換勾選不該把畫面丟回底部。
+        """
+        if self.dev_log_area is None:
+            return
+        rows = [(t, tag) for t, tag, cat in self._dev_lines if self._dev_visible(cat)]
+        box = self.dev_log_area._textbox
+        top = box.yview()[0]
+        self.dev_log_area.configure(state="normal")
+        self.dev_log_area.delete("1.0", "end")
+        if rows:
+            # 一次 insert 全文再用行號補 tag (逐行 insert 數百筆會卡,同 _render_log)
+            self.dev_log_area.insert("1.0", "\n".join(t for t, _ in rows) + "\n")
+            for row, (_, tag) in enumerate(rows, start=1):
+                if tag:
+                    box.tag_add(tag, f"{row}.0", f"{row}.end+1c")
+        if scroll_end:
+            self.dev_log_area.see("end")
+        else:
+            box.yview_moveto(top)
+        self.dev_log_area.configure(state="disabled")
+
+    def _on_dev_filter_change(self, key):
+        self._dev_filter[key] = bool(self._dev_filter_vars[key].get())
+        self.settings[f"dev_filter_{key}"] = self._dev_filter[key]
+        save_settings(self.settings)
+        self._dev_render_all()
 
     def _close_dev_popout(self):
         """關閉診斷視窗。內容在 _dev_lines 裡,重開時原樣還原。"""
@@ -1844,6 +1952,8 @@ class LiveDamageMonitor:
             self._dev_popout_win = None
         self.dev_pane = None
         self.dev_log_area = None
+        # 勾選狀態留在 self._dev_filter,var 跟著 widget 一起丟掉
+        self._dev_filter_vars = {}
 
     def _on_popout_closed(self, kind):
         """使用者點 Toplevel 的 X → 對應 checkbox 取消勾選 → dock 回主視窗。
@@ -1998,6 +2108,13 @@ class LiveDamageMonitor:
         self.settings["track_heal"] = self.track_heal
         save_settings(self.settings)
         self._apply_tracking_mode()
+
+    def _on_detect_chain_change(self):
+        """連攜攻擊偵測開關。只影響之後收到的封包,不重算已累積的統計 ——
+        中途切換會讓同一場的資料前後定義不一致,要乾淨就按「清除」重來。"""
+        self.detect_chain = self.detect_chain_var.get()
+        self.settings["detect_chain"] = self.detect_chain
+        save_settings(self.settings)
 
     def toggle_heal_collapse(self):
         """折疊/展開治癒事件日誌。折疊時 heal_log_area 隱藏但持續寫入。"""
@@ -2815,10 +2932,23 @@ class LiveDamageMonitor:
             font=(FONT_UI, 12),
         ).pack(anchor="w", pady=4)
 
+        ctk.CTkCheckBox(
+            track_section,
+            text="連攜攻擊偵測  (隊友掛在你身上觸發的傷害,例如治癒師 1 技的光波)",
+            variable=self.detect_chain_var,
+            command=self._on_detect_chain_change,
+            corner_radius=5, checkbox_width=18, checkbox_height=18,
+            font=(FONT_UI, 12),
+        ).pack(anchor="w", pady=4)
+
         ctk.CTkLabel(track_section,
                      text="※ 攻擊數值/治癒數值可同時勾選;至少留一個開啟以免主畫面空白\n"
                           "※ 攻擊數值只統計「攻擊者 = 自己」的傷害,寵物/隊友/敵人不計入;\n"
-                          "　 尚未偵測到角色 ID 時一律不記錄,可用控制列的「強制偵測」暫時全收",
+                          "　 尚未偵測到角色 ID 時一律不記錄,可用控制列的「強制偵測」暫時全收\n"
+                          "※ 連攜傷害「一律不計入」總傷害/DPS/技能排名 —— 那是隊友的技能;\n"
+                          "　 未勾選:整筆剔除,日誌也不顯示\n"
+                          "　 已勾選:日誌以黃字標註 (連攜) 並寫進存檔,但仍不計入統計\n"
+                          "　 「強制偵測」下分不出誰是誰,連攜一律照常顯示並計入",
                      font=(FONT_UI, 10),
                      text_color="#888888", anchor="w", justify="left").pack(fill="x", pady=(8, 0))
 
@@ -3496,9 +3626,10 @@ class LiveDamageMonitor:
         """紅字錯誤訊息(共用 highlight tag)。"""
         self._append_log(text, error=True)
 
-    def log_damage(self, text, tags, target_id):
-        """攻擊事件:記下受擊目標,供切換目標時過濾。"""
-        self._append_log(text, target=target_id, tags=tags)
+    def log_damage(self, text, tags, target_id, color=None):
+        """攻擊事件:記下受擊目標,供切換目標時過濾。
+        color 目前只有 "chain" (連攜傷害,黃字);高亮標籤的紅字優先權仍在它之上。"""
+        self._append_log(text, target=target_id, tags=tags, color=color)
 
 
     @staticmethod
@@ -3514,10 +3645,14 @@ class LiveDamageMonitor:
 
         tag 省略時依訊息裡的 ✗ / ⚠ / ★ 自動上色 —— 身分偵測失敗那幾行
         (抓不到角色 ID / 本場尚未綁定) 才不會被淹沒在整片灰字裡。
+
+        分類由訊息開頭的 [XXX] 決定 (見 DEV_CATEGORIES),被勾掉的分類只是不寫進
+        展開視窗,緩衝與底部單行照舊。
         """
         if tag is None:
             tag = self._dev_tag_of(text)
-        self._dev_lines.append((text, tag))
+        cat = DEV_PREFIX_CAT.get(text.split(" ", 1)[0])
+        self._dev_lines.append((text, tag, cat))
         # 底部只有一行,換行字元會把 button 撐高,長行也要截斷
         line = text.replace("\n", " ")
         if len(line) > DEV_STRIP_MAX_CHARS:
@@ -3529,14 +3664,15 @@ class LiveDamageMonitor:
         except Exception:
             pass
         # 視窗關閉時 widget 不存在 (寫入是 after() 排程,可能晚於關窗)
-        if self.dev_log_area is None:
+        if self.dev_log_area is None or not self._dev_visible(cat):
             return
+        # 不呼叫 see("end") —— 新訊息不搶捲軸,使用者往上翻的位置留得住。
+        # 要看最新的自己捲到底,或關掉重開視窗 (開窗時會停在最後一行)
         self.dev_log_area.configure(state="normal")
         if tag:
             self.dev_log_area._textbox.insert("end", text + "\n", tag)
         else:
             self.dev_log_area.insert("end", text + "\n")
-        self.dev_log_area.see("end")
         self.dev_log_area.configure(state="disabled")
 
     # ================================================
@@ -3729,24 +3865,54 @@ class LiveDamageMonitor:
     # ================================================
     # 封包解析
     # ================================================
-    def find_skill_id_after(self, payload, start):
-        """在 start offset 後方(200 bytes 內)尋找 0x4FEC TLV, 回傳其 skill_id。
-        參考 MM_Scribe_PacketNotes.md §5: skill_id 位於該 block payload offset 17..20。
+    @staticmethod
+    def _read_skill_tlv(payload, off):
+        """payload[off] 起若是合法的 0x4FEC (size 35),回傳
+        (skill_id, 施法者 ID, 目標 ID, 7 bytes 旗標);否則 None。
+
+        欄位位置見筆記 §5:key1 在 +25,userId 在 +9,targetId 在 +17,
+        旗標 7 bytes 在 +33 (= content+24),與 0x5235 的 +41 是同一組值。
         """
-        payload_len = len(payload)
-        limit = min(start + 200, payload_len - 8)
-        scan = start
-        while scan < limit:
-            if payload[scan:scan+4] == SKILL_TLV_MAGIC:
-                try:
-                    sz = struct.unpack("<I", payload[scan+4:scan+8])[0]
-                    if sz == 35 and scan + 8 + 21 <= payload_len:
-                        return struct.unpack("<I", payload[scan+25:scan+29])[0]
-                except Exception:
-                    pass
+        if off + 9 + 35 > len(payload) or payload[off:off+4] != SKILL_TLV_MAGIC:
+            return None
+        try:
+            if struct.unpack("<I", payload[off+4:off+8])[0] != 35:
                 return None
-            scan += 1
-        return None
+            return (struct.unpack("<I", payload[off+25:off+29])[0],
+                    struct.unpack("<I", payload[off+9:off+13])[0],
+                    struct.unpack("<I", payload[off+17:off+21])[0],
+                    bytes(payload[off + SKILL_TLV_FLAG_BASE:
+                                  off + SKILL_TLV_FLAG_BASE + DMG_FLAG_LEN]))
+        except Exception:
+            return None
+
+    def find_dmg_skill(self, payload, dmg_off, size, target_id, flags):
+        """替一筆 0x5235 找出它的 0x4FEC,回傳 (skill_id, 施法者 ID)。
+
+        雙向掃 ±DMG_SKILL_NEAR_WINDOW,只收「目標 ID 相同 + 7 bytes 旗標全等」
+        的候選,取距離最近的那個。理由與實測數據見 DMG_SKILL_NEAR_WINDOW 上方註解。
+
+        舊版的單向往後掃有兩個 bug,一併解掉:
+          1. 連攜傷害的 0x4FEC 在自己的 0x5235 前面 → 整批技能名往後錯一格,
+             最後一筆抓不到變 "??????"
+          2. 掃到 size != 35 的 0x4FEC 就 return None 提早中止,不再往後找
+        找不到就回 (None, None) —— DoT 那種本來就沒有伴生 0x4FEC 的照舊不列入排行。
+        """
+        want = bytes(flags)
+        dmg_end = dmg_off + 9 + (size if size > 0 else DMG_EVENT_SIZE)
+        lo = max(0, dmg_off - DMG_SKILL_NEAR_WINDOW)
+        hi = min(len(payload), dmg_end + DMG_SKILL_NEAR_WINDOW)
+        best = (None, None)
+        best_dist = None
+        pos = payload.find(SKILL_TLV_MAGIC, lo, hi)
+        while pos != -1:
+            got = self._read_skill_tlv(payload, pos)
+            if got is not None and got[2] == target_id and got[3] == want:
+                dist = abs(pos - dmg_off)
+                if best_dist is None or dist < best_dist:
+                    best, best_dist = (got[0], got[1]), dist
+            pos = payload.find(SKILL_TLV_MAGIC, pos + 1, hi)
+        return best
 
     @staticmethod
     def _brotli_head(data, n):
@@ -4509,14 +4675,100 @@ class LiveDamageMonitor:
             f"時長={self._buff_duration_text(dur_raw)} "
             f"層數={stacks} 來源:{self._target_label(src)} key={key}")
 
-    def parse_payload(self, payload):
-        offset = 0
+    def _dmg_feed(self, payload, conn_key, seq):
+        """把同一條 TCP 連線的位元組接起來再餵 parse_payload。
+
+        不是完整的 TCP stack,只處理「連續」這一件事:
+          * seq 接得上 → 續在上一包的尾巴後面,被切成兩半的事件就補得回來
+          * 整包都落在目前緩衝區間內 → 重傳,直接丟掉
+          * 部分重疊 → 只把新的那一截接上去
+          * 中間缺一段 / 亂序 → 先把還在等的事件放行,再從這包重新開始,
+            且這包單獨判 (不再等後續),退化成改版前的逐封包行為
+
+        重複計算靠 stream["reported"] (絕對 seq 高水位) 擋掉,不靠內容比對 ——
+        同一輪爆發出現兩筆數值與旗標完全相同的傷害是正常的,內容比對會誤殺。
+        代價是亂序時排在高水位之前的那包會被跳過:對 DPS 統計而言,少算一筆
+        遠比重複算一筆好,而且亂序本來就罕見 (實測 5557 封包一次都沒發生)。
+        """
+        st = self._dmg_streams.get(conn_key)
+        if st is None:
+            st = {"buf": b"", "abs": seq, "reported": seq, "next": seq, "pend": 0.0}
+            self._dmg_streams[conn_key] = st
+            while len(self._dmg_streams) > DMG_STREAM_MAX_CONNS:
+                self._dmg_streams.popitem(last=False)
+        else:
+            self._dmg_streams.move_to_end(conn_key)
+
+        end = (seq + len(payload)) & 0xFFFFFFFF
+        force = False
+        if seq == st["next"]:
+            st["buf"] += payload
+        elif not seq_before(seq, st["abs"]) and not seq_before(st["next"], end):
+            return                                  # 整包都在緩衝裡了 → 重傳
+        elif seq_before(seq, st["next"]):
+            st["buf"] += payload[(st["next"] - seq) & 0xFFFFFFFF:]   # 只接新的那一截
+        else:
+            # 缺口/亂序:先把還在等後方資料的事件放行,別跟著緩衝一起丟掉
+            if st["pend"]:
+                self.parse_payload(st["buf"], stream=st, flush=True)
+            st["buf"] = payload
+            st["abs"] = seq
+            st["pend"] = 0.0
+            force = True
+        # 不變式:abs + len(buf) 永遠等於 next,否則下一包接不上會誤判成缺口
+        st["next"] = (st["abs"] + len(st["buf"])) & 0xFFFFFFFF
+
+        # pend = 這一輪「等後方資料」的起始時間。每次重設會讓逾時永遠不成立,
+        # 所以沒 flush 就把原本的起點放回去,等夠久才真的放行。
+        prev_pend = st["pend"]
+        flush = force or (bool(prev_pend)
+                          and time.time() - prev_pend >= DMG_PAIR_FLUSH_SEC)
+        st["pend"] = 0.0
+        self.parse_payload(st["buf"], stream=st, flush=flush)
+        if st["pend"] and prev_pend and not flush:
+            st["pend"] = prev_pend
+
+        drop = len(st["buf"]) - DMG_STREAM_CARRY
+        if drop > 0:
+            st["buf"] = st["buf"][drop:]
+            st["abs"] = (st["abs"] + drop) & 0xFFFFFFFF
+
+    def parse_payload(self, payload, stream=None, flush=False):
+        """掃 payload 裡的 0x5235 傷害事件並累計統計。
+
+        stream=None 走舊的「單一封包」模式 (合成封包 smoke test 仍照這條路徑)。
+        由 _dmg_feed 餵進來時 stream 是該連線的接續狀態,多做兩件事:
+          * 用絕對 seq 位置記「回報到哪」,重傳/重疊的位元組不會被算第二次
+          * 事件後方還沒收滿配對視窗就停下來等下一包,避免把被切斷的事件
+            或「0x4FEC 還沒到」的事件判成抓不到技能
+        """
         payload_len = len(payload)
+        offset = 0
+        if stream is not None:
+            # 已回報過的區段不必再掃 (reported 是絕對 seq,單調遞增)
+            done = (stream["reported"] - stream["abs"]) & 0xFFFFFFFF
+            if done < payload_len:
+                offset = done
 
         while offset < payload_len - 4:
             if payload[offset:offset+4] == DMG_EVENT_MAGIC:
                 try:
                     size = struct.unpack("<I", payload[offset+4:offset+8])[0]
+
+                    if stream is not None and size == DMG_EVENT_SIZE:
+                        abs_off = (stream["abs"] + offset) & 0xFFFFFFFF
+                        if seq_before(abs_off, stream["reported"]):
+                            offset += size + 8
+                            continue
+                        # 配對要雙向掃,所以事件後方也要收滿視窗才判得準;
+                        # 沒收滿就原地等下一包 (逾時由 flush 強制放行)
+                        need = offset + 9 + size
+                        if not flush:
+                            need += DMG_SKILL_NEAR_WINDOW
+                        if need > payload_len:
+                            stream["pend"] = time.time()
+                            return
+                        stream["reported"] = (abs_off + 1) & 0xFFFFFFFF
 
                     if offset + 55 <= payload_len:
                         dmg_val = struct.unpack("<I", payload[offset+25:offset+29])[0]
@@ -4568,15 +4820,20 @@ class LiveDamageMonitor:
                         is_sustain = (not is_dot) and all(
                             flags[idx] & mask for idx, mask in DMG_SUSTAIN_BITS)
 
-                        # 嘗試從後續的 0x4FEC TLV 抽出 skill_id (可能為 None)
-                        # 事件實際總長為 9 + size (標頭含 encodingType),這裡刻意用 +8 起掃:
-                        # 起點早 1 byte 只是多掃一輪,起點晚 1 byte 會直接跳過 magic。
-                        skill_id = self.find_skill_id_after(payload, offset + 8 + size)
+                        # 雙向找伴生的 0x4FEC,拿到技能 ID 與「誰放的」(見 find_dmg_skill)
+                        skill_id, caster_id = self.find_dmg_skill(
+                            payload, offset, size, target_id, flags)
+                        # 連攜:技能是別人放的,傷害卻掛在自己身上 (治癒師 1 技光波等)。
+                        # 統計照舊算自己的輸出 —— 遊戲本來就是這樣算的,只在日誌上標記。
+                        is_chain = caster_id is not None and caster_id != attacker_id
 
                         if self.is_dev_mode:
                             # 開發者面板不受統計門檻影響:別人的傷害照印,
                             # 這是驗證身分偵測對不對的唯一依據
                             skill_txt = f"0x{skill_id:08X}" if skill_id is not None else "(未取得)"
+                            # 連攜時把真正的施法者印出來 —— 傷害事件本身查不到這個 ID
+                            if is_chain:
+                                skill_txt += f" 連攜←0x{caster_id:08X}"
                             flags_txt = " ".join(f"{b:02X}" for b in flags)
                             # 候選位元:僅顯示,不影響統計。用來驗證 packet-protocol.md 的推論
                             hits = [name for idx, mask, name in DMG_FLAG_CANDIDATES
@@ -4624,6 +4881,17 @@ class LiveDamageMonitor:
                                 # 真的有傷害被丟掉時才提醒 (本場一次),換場景瞬間不出聲 —
                                 # 綁定通常一秒內就補回來,提早報只會變成每次換圖閃一行紅字
                                 self._ident_warn_no_id()
+                            offset += (size + 8) if size > 0 else 35
+                            continue
+
+                        # 2.5 連攜傷害:技能是隊友放的,傷害卻掛在自己身上
+                        #     (治癒師 1 技的光波等)。那不是你的輸出,一律不進統計桶。
+                        #     「強制偵測」是旁路模式,連自己是誰都還沒認出來,分不出
+                        #     誰連攜誰 —— 那裡照常顯示並計入,語意才跟「全部都收」一致。
+                        #       選項關閉 → 整筆剔除,日誌也不印
+                        #       選項開啟 → 印黃字 + 記進時間序列 (存檔留得住),但不計統計
+                        chain_cut = is_chain and not self.force_all
+                        if chain_cut and not self.detect_chain:
                             offset += (size + 8) if size > 0 else 35
                             continue
 
@@ -4676,10 +4944,13 @@ class LiveDamageMonitor:
 
                         tag_str = f"[{'+'.join(tags)}]" if tags else "[普通]"
 
-                        # 4. 傷害累加:同一筆同時進 TARGET_ALL 與該攻擊對象兩個桶
+                        # 4. 傷害累加:同一筆同時進 TARGET_ALL 與該攻擊對象兩個桶。
+                        #    連攜 (chain_cut) 只走下面的時間序列,不碰統計桶。
+                        #    目標仍然要註冊 —— 你確實打到它了,不註冊的話存檔裡的
+                        #    事件會指向一個不存在於 target_order 的目標。
                         self._register_target(target_id)
                         now = time.time()
-                        for _key in (TARGET_ALL, target_id):
+                        for _key in () if chain_cut else (TARGET_ALL, target_id):
                             b = self._bucket(_key)
                             b["damage"] += dmg_val
                             if b["first"] is None:
@@ -4731,10 +5002,11 @@ class LiveDamageMonitor:
                         # 所以每筆單獨記一列 (日誌上不顯示)。
                         self.damage_events.append(
                             (now, target_id, skill_id, dmg_val,
-                             dmg_event_flags(tags, is_dot, is_sustain)))
+                             dmg_event_flags(tags, is_dot, is_sustain, is_chain)))
 
                         # 只有這筆會影響到「目前顯示中的目標」時才重畫
-                        if self.selected_target in (TARGET_ALL, target_id):
+                        # (連攜沒動到任何統計桶,重畫出來會一模一樣)
+                        if not chain_cut and self.selected_target in (TARGET_ALL, target_id):
                             self.root.after(0, self._refresh_stats_view)
 
                         # 技能欄:優先用 skills.ini 對照,skill_id=0 標為符文,否則顯示 hex ID
@@ -4748,12 +5020,16 @@ class LiveDamageMonitor:
                             skill_display += DMG_DOT_SUFFIX
                         elif is_sustain:
                             skill_display += DMG_SUSTAIN_SUFFIX
+                        # 連攜註記獨立於 (Dot)/(間接):來源是「誰放的」,不是旗標
+                        if is_chain:
+                            skill_display += DMG_CHAIN_SUFFIX
                         # tab 分隔欄位,tab stop 已在初始化時設定於固定像素位置。
                         # 行首多一個 tab:傷害值靠第一個 (right) 停靠點右對齊,
                         # 不再補空白 — 補空白只在等寬字體下才對得齊。
                         msg = f"\t{dmg_val:,}\t{tag_str}\t{skill_display}"
-                        self.root.after(0, lambda m=msg, t=list(tags), tid=target_id:
-                                        self.log_damage(m, t, tid))
+                        self.root.after(0, lambda m=msg, t=list(tags), tid=target_id,
+                                        c="chain" if is_chain else None:
+                                        self.log_damage(m, t, tid, color=c))
 
                     # 事件實際總長為 9 + size,但這裡維持 +8:主迴圈是逐 byte 掃 magic,
                     # 落在前 1 byte 會自動被下一輪修正;落在後 1 byte 則會整個跳過下一筆。
@@ -5036,7 +5312,8 @@ class LiveDamageMonitor:
         if not self.is_monitoring:
             return
         if self.track_damage:
-            self.parse_payload(raw_payload)
+            # 走接續路徑:被切在 TCP segment 邊界的傷害事件才不會整筆漏掉
+            self._dmg_feed(raw_payload, conn_key, tcp_layer.seq)
         if self.track_heal:
             self.parse_heal_shield(raw_payload)
 

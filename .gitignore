@@ -14,4 +14,6 @@ Note/Ref/
 Note/0909MM封包更新.md
 Release/
 Save/
+# Wireshark 實機錄包:內含真實網路流量,只留在本機
+Capture/
 version_info*.txt
