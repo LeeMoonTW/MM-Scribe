@@ -141,7 +141,8 @@ SETTINGS_CFG_NAME = "settings.ini"
 DEFAULT_GAME_PROCESSES = ("mabinogimobile.exe",)
 # 存檔 (「紀錄 / 讀取」):檔案放在 EXE (或原始碼) 旁的 Save/ 資料夾
 SAVE_DIR_NAME = "Save"
-SAVE_FILE_PREFIX = "MMScribe_"
+SAVE_FILE_PREFIX = "MM_"
+SAVE_FILE_PREFIXES = (SAVE_FILE_PREFIX, "MMScribe_")  # 新格式 + 舊版存檔
 SAVE_FILE_EXT = ".json"
 # 存檔格式版號。欄位語意變動時 +1;讀檔遇到不認得的版號直接拒讀,
 # 免得舊檔被當成新格式塞進 target_stats,畫面數字錯得無聲無息。
@@ -152,6 +153,25 @@ FONT_SCALE_MIN = 1.0
 FONT_SCALE_MAX = 2.0
 FONT_SCALE_DEFAULT = 1.0
 MERGE_GROUP_SECTION = "合併群組"
+JOB_ABBREVIATIONS = {
+    "戰士": "WAR",
+    "大劍戰士": "GSW",
+    "劍術士": "SWD",
+    "魔法師": "MAG",
+    "冰霜術士": "ICE",
+    "弓箭手": "ARC",
+    "長弓兵": "LBG",
+    "弩手": "XBW",
+    "祭司": "PRI",
+    "修道士": "MNK",
+    "吟遊詩人": "BRD",
+    "樂師": "MUS",
+    "舞者": "DNC",
+    "雙刀客": "DBL",
+    "治癒師": "HLR",
+    "寵物": "PET",
+    "未分類": "UNK",
+}
 # 註:舊版的「忽略寵物攻擊」設定已移除 — 統計改用角色 ID 門檻 (只收攻擊者 == 自己的
 # 傷害),寵物是獨立實體,本來就不會進統計。skills.ini 的 [寵物] 區段仍照常提供技能名。
 # Skill ID 提取 (見 HEAL_SHIELD_SKILL_ID.md §4)
@@ -480,8 +500,9 @@ def load_skill_config():
 
     後綴僅為註記,所有合併群組區段共用同一命名空間;群組名跨區段重複時會觸發衝突。
 
-    回傳 (skill_names, merge_groups, conflicts, errors)
+    回傳 (skill_names, skill_jobs, merge_groups, conflicts, errors)
       - skill_names:  dict[int skill_id, str display_name]
+      - skill_jobs:   dict[int skill_id, str job_name]
       - merge_groups: dict[str member_name, str group_name]
       - conflicts:    list[(member, first_group, ignored_group)] 供 UI 提示
       - errors:       list[str] 解析過程中的錯誤訊息 (檔案級 or 逐行) 供 UI 顯示
@@ -489,7 +510,7 @@ def load_skill_config():
     """
     path = get_external_path(SKILL_CFG_NAME)
     if not os.path.exists(path):
-        return {}, {}, [], []
+        return {}, {}, {}, [], []
     errors = []
     parser = configparser.ConfigParser()
     parser.optionxform = str  # 保留原大小寫,避免 0x64D 被轉小寫影響閱讀
@@ -497,23 +518,24 @@ def load_skill_config():
         parser.read(path, encoding="utf-8")
     except configparser.DuplicateOptionError as e:
         errors.append(f"重複的 key:[{e.section}] '{e.option}' (第 {e.lineno} 行) — INI 同一區段內不允許同名 key")
-        return {}, {}, [], errors
+        return {}, {}, {}, [], errors
     except configparser.DuplicateSectionError as e:
         errors.append(f"重複的區段:[{e.section}] (第 {e.lineno} 行)")
-        return {}, {}, [], errors
+        return {}, {}, {}, [], errors
     except configparser.MissingSectionHeaderError as e:
         errors.append(f"缺少區段標頭:第 {e.lineno} 行 '{e.line.strip()}' — 檔案開頭必須先有 [區段名]")
-        return {}, {}, [], errors
+        return {}, {}, {}, [], errors
     except configparser.ParsingError as e:
         errors.append(f"解析錯誤:{e}")
-        return {}, {}, [], errors
+        return {}, {}, {}, [], errors
     except UnicodeDecodeError as e:
         errors.append(f"編碼錯誤:檔案不是 UTF-8 (byte {e.start}: {e.reason}) — 請以 UTF-8 存檔")
-        return {}, {}, [], errors
+        return {}, {}, {}, [], errors
     except Exception as e:
         errors.append(f"未預期錯誤:{type(e).__name__}: {e}")
-        return {}, {}, [], errors
+        return {}, {}, {}, [], errors
     names = {}
+    jobs = {}
     groups = {}
     conflicts = []
 
@@ -549,12 +571,13 @@ def load_skill_config():
             name = value.strip()
             if name:
                 names[skill_id] = name
-    return names, groups, conflicts, errors
+                jobs[skill_id] = section.strip()
+    return names, jobs, groups, conflicts, errors
 
 
 # 每次按下「開始」都會重新讀取 (見 start_monitoring)
 # 開程式時預先載一次,方便主程式建立初始狀態
-SKILL_NAMES, MERGE_GROUPS, _, _ = load_skill_config()
+SKILL_NAMES, SKILL_JOBS, MERGE_GROUPS, _, _ = load_skill_config()
 
 
 def load_effect_names():
@@ -1558,6 +1581,35 @@ class LiveDamageMonitor:
         self.ctrl_row4.pack(side="bottom", fill="x", padx=10, pady=(0, 3))
         ctrl_row4 = self.ctrl_row4  # local alias,與其他控制列一致
 
+        # 存檔命名列。留空的欄位不會產生多餘的底線。
+        self.save_name_row = ctk.CTkFrame(root, corner_radius=0)
+        self.save_name_row.pack(side="bottom", fill="x", padx=10, pady=(0, 3))
+        self.save_tag_var = tk.StringVar()
+        self.save_avoid_duplicate_var = tk.BooleanVar(value=True)
+        self.save_timestamp_var = tk.BooleanVar(value=True)
+        self.save_job_var = tk.BooleanVar(value=True)
+        self.save_tag_enabled_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            self.save_name_row, text="避免重覆LOG",
+            variable=self.save_avoid_duplicate_var, width=104).pack(
+                side="left", padx=(8, 2), pady=6)
+        self.save_timestamp_check = ctk.CTkCheckBox(
+            self.save_name_row, text="自動日期", variable=self.save_timestamp_var,
+            width=82)
+        self.save_timestamp_check.pack(side="left", padx=2, pady=6)
+        ctk.CTkCheckBox(
+            self.save_name_row, text="自動職業", variable=self.save_job_var,
+            width=82).pack(side="left", padx=2, pady=6)
+        ctk.CTkCheckBox(
+            self.save_name_row, text="標籤", variable=self.save_tag_enabled_var,
+            command=self._toggle_save_tag, width=58).pack(
+                side="left", padx=2, pady=6)
+        self.save_tag_entry = ctk.CTkEntry(
+            self.save_name_row, textvariable=self.save_tag_var,
+            placeholder_text="tag", width=105)
+        self.save_tag_entry.pack(
+            side="left", padx=2, pady=6)
+
         self.btn_save = ctk.CTkButton(ctrl_row4, text="💾 紀錄", width=70, corner_radius=8,
                                       fg_color="#5a7a9a", hover_color="#6a8aaa",
                                       command=self.save_snapshot)
@@ -2098,6 +2150,7 @@ class LiveDamageMonitor:
         """
         self.root.update_idletasks()
         parts = [self.ctrl_row1, self.ctrl_row2, self.ctrl_row3, self.ctrl_row4,
+                 self.save_name_row,
                  self.status_bar]
         # 底部診斷區塊是常駐的 (發布版除外),最小高度要把它算進去
         if self.dev_strip.winfo_manager():
@@ -5386,8 +5439,8 @@ class LiveDamageMonitor:
         self.btn_stop.configure(state="normal", fg_color="#d63031", hover_color="#b02a2c")
 
         # 每次按下開始都重新讀取 skills.ini,讓使用者修改後不用重啟程式
-        global SKILL_NAMES, MERGE_GROUPS
-        SKILL_NAMES, MERGE_GROUPS, conflicts, ini_errors = load_skill_config()
+        global SKILL_NAMES, SKILL_JOBS, MERGE_GROUPS
+        SKILL_NAMES, SKILL_JOBS, MERGE_GROUPS, conflicts, ini_errors = load_skill_config()
         if ini_errors:
             self.log_error(f"❌ 載入 {SKILL_CFG_NAME} 時發生錯誤:")
             for err in ini_errors:
@@ -5744,21 +5797,97 @@ class LiveDamageMonitor:
             "log_entries": entries,
         }
 
+    def _toggle_save_tag(self):
+        """標籤未勾選時停用輸入欄。"""
+        self.save_tag_entry.configure(
+            state="normal" if self.save_tag_enabled_var.get() else "disabled")
+
+    def _detected_job_name(self):
+        """依本場已記錄的技能判斷職業;連攜傷害屬於隊友,不拿來判斷。"""
+        counts = collections.Counter()
+        for _ts, _target_id, skill_id, _damage, flags in self.damage_events:
+            if skill_id is None or flags & DMG_EVENT_CHAIN_BIT:
+                continue
+            job = SKILL_JOBS.get(skill_id)
+            if job:
+                counts[job] += 1
+        if not counts:
+            return "UNK"
+        return JOB_ABBREVIATIONS.get(counts.most_common(1)[0][0], "UNK")
+
     def save_snapshot(self):
-        """把當前所有統計寫成 Save/MMScribe_<日期時間>.json。
-        檔名用 %Y%m%d_%H%M%S:字串排序即時間排序,且不含 Windows 禁用的 ':'。
-        """
+        """把當前統計寫進 Save/,並避免同一份日誌被重複存檔。"""
         try:
             data = self._snapshot_dict()
         except Exception as exc:
             self.log_error(f"❌ 建立存檔內容失敗:{exc}")
             return
+
+        # saved_at 每次都不同;「已存檔」提示也是存檔動作本身產生的,兩者都不能
+        # 用來判斷內容是否有更新。其餘日誌內容相同就視為同一份紀錄。
+        ignored_save_messages = ("=== 已存檔 ", "=== 已讀取存檔 ",
+                                 "=== 純檢視模式:",
+                                 "⚠️ 日誌內容沒有更新,未重複存檔",
+                                 "⚠️ 日誌內容與最近存檔 ")
+        def log_signature(entries):
+            meaningful = [entry for entry in entries
+                          if not str(entry.get("text", "")).startswith(
+                              ignored_save_messages)]
+            return json.dumps(meaningful, ensure_ascii=False, sort_keys=True,
+                              separators=(",", ":"))
+
+        signature = log_signature(data["log_entries"])
+
         save_dir = get_save_dir()
-        name = SAVE_FILE_PREFIX + time.strftime("%Y%m%d_%H%M%S")
+        # Windows 與 macOS 都能安全使用的檔名;不可用字元以底線取代。
+        def clean_part(value):
+            value = "".join("_" if ord(ch) < 32 or ch in '<>:"/\\|?*' else ch
+                            for ch in value.strip())
+            return value.strip(" ._")
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        parts = []
+        if self.save_timestamp_var.get():
+            parts.append(timestamp)
+        if self.save_job_var.get():
+            parts.append(clean_part(self._detected_job_name()))
+        if self.save_tag_enabled_var.get():
+            tag = clean_part(self.save_tag_var.get())
+            if tag:
+                parts.append(tag)
+        if not parts:
+            parts.append(timestamp)
+        name = SAVE_FILE_PREFIX + "_".join(parts)
+        path = os.path.join(save_dir, name + SAVE_FILE_EXT)
         try:
             os.makedirs(save_dir, exist_ok=True)
-            with open(os.path.join(save_dir, name + SAVE_FILE_EXT),
-                      "w", encoding="utf-8") as f:
+            # 只跟最近一次存檔比較。這符合連續按紀錄時避免重覆的用途,同時允許
+            # 使用者日後刻意另存一份與較舊紀錄相同的內容。
+            if self.save_avoid_duplicate_var.get():
+                candidates = [filename for filename in os.listdir(save_dir)
+                              if filename.startswith(SAVE_FILE_PREFIXES)
+                              and filename.endswith(SAVE_FILE_EXT)]
+                latest = max(
+                    candidates,
+                    key=lambda filename: os.path.getmtime(
+                        os.path.join(save_dir, filename)),
+                    default=None)
+                if latest:
+                    latest_path = os.path.join(save_dir, latest)
+                    try:
+                        with open(latest_path, "r", encoding="utf-8") as existing_file:
+                            existing = json.load(existing_file)
+                        existing_signature = log_signature(
+                            existing.get("log_entries", []))
+                    except (OSError, ValueError, TypeError, AttributeError):
+                        existing_signature = None
+                    if existing_signature == signature:
+                        self.log_error(f"⚠️ 日誌內容與最近存檔 {latest} 相同,未重複存檔")
+                        return
+            if os.path.exists(path):
+                self.log_error(f"❌ 存檔名稱已存在,請修改日期、職業或標籤選項:{name}")
+                return
+            with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=1)
         except (OSError, TypeError, ValueError) as exc:
             self.log_error(f"❌ 存檔失敗:{exc}")
@@ -5774,7 +5903,7 @@ class LiveDamageMonitor:
         names = []
         try:
             for fn in os.listdir(get_save_dir()):
-                if fn.startswith(SAVE_FILE_PREFIX) and fn.endswith(SAVE_FILE_EXT):
+                if fn.startswith(SAVE_FILE_PREFIXES) and fn.endswith(SAVE_FILE_EXT):
                     names.append(fn[:-len(SAVE_FILE_EXT)])
         except OSError:
             pass   # 資料夾還沒建立 = 還沒存過檔,不是錯誤
