@@ -34,6 +34,7 @@ import csv
 import io
 import json
 import os
+import queue
 import struct
 import subprocess
 import sys
@@ -1048,8 +1049,29 @@ ctk.set_default_color_theme("dark-blue")
 
 
 class LiveDamageMonitor:
+    def _post_ui(self, callback):
+        """Queue UI work without calling Tcl/Tk from a worker thread."""
+        self._ui_callbacks.put(callback)
+
+    def _drain_ui_callbacks(self):
+        """Run queued callbacks on the Tk thread, yielding between batches."""
+        try:
+            for _ in range(200):
+                try:
+                    callback = self._ui_callbacks.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    callback()
+                except Exception:
+                    self.root.report_callback_exception(*sys.exc_info())
+        finally:
+            self.root.after(25, self._drain_ui_callbacks)
+
     def __init__(self, root):
         self.root = root
+        self._ui_callbacks = queue.SimpleQueue()
+        self.root.after(25, self._drain_ui_callbacks)
 
         # 讀設定並在建立任何 widget 前先套用縮放 (widget/window scaling 都是全域狀態,
         # 提前設好 CTk 建立的元件會直接以正確尺寸誕生,不必事後重排)
@@ -2064,7 +2086,7 @@ class LiveDamageMonitor:
 
         # 依當前佈局重算 minsize,確保 status_bar 不會被 log/skill/heal 這些
         # expand=True 的面板擠掉。用 after(0) 讓 Tk 完成本次 pack 再量高度
-        self.root.after(0, self._refresh_minsize)
+        self._post_ui(self._refresh_minsize)
 
     def _refresh_minsize(self):
         """依「當前顯示的 banner + 4 條控制列 + status_bar」總高度,
@@ -2240,7 +2262,7 @@ class LiveDamageMonitor:
                            + " or ".join(f"port {p}" for p in sorted(ports)) + ")")
                     lo = find_loopback_iface()
                     if lo is None:
-                        self.root.after(0, lambda d=pdesc: on_progress(
+                        self._post_ui(lambda d=pdesc: on_progress(
                             "warn", f"偵測到本機網路代理 ({d}),但找不到 Loopback 擷取介面",
                             "請重新安裝 Npcap 並勾選「Support loopback traffic」",
                             "先改用一般網卡掃描"))
@@ -2248,7 +2270,7 @@ class LiveDamageMonitor:
                         lo_name = str(lo.get("description") or lo.get("name") or "Loopback")
                         # 用 active 而非 info:這是要讓使用者看到的狀態切換,
                         # info 會被啟動流程的日誌過濾當成逐張網卡的細節擋掉
-                        self.root.after(0, lambda d=pdesc, p=port_str: on_progress(
+                        self._post_ui(lambda d=pdesc, p=port_str: on_progress(
                             "active", f"偵測到本機網路代理 ({d})",
                             f"遊戲連線被接到本機 port {p},改掃 Loopback"))
                         count = 0
@@ -2259,36 +2281,36 @@ class LiveDamageMonitor:
                                                timeout=max(per_iface_timeout, 3),
                                                store=True))
                         except Exception as e:
-                            self.root.after(0, lambda n=lo_name, err=e: on_progress(
+                            self._post_ui(lambda n=lo_name, err=e: on_progress(
                                 "warn", f"{n}", f"sniff 失敗: {err}"))
                         if count > 0:
                             chosen = dict(lo)
                             chosen["description"] = (
                                 f"Loopback 代理模式 — {pdesc} (port {port_str})")
                             chosen["_filter"] = flt
-                            self.root.after(0, lambda d=chosen["description"], c=count:
+                            self._post_ui(lambda d=chosen["description"], c=count:
                                             on_progress("ok", f"✓ {d}",
                                                         f"收到 {c} 個目標封包"))
-                            self.root.after(0, lambda c=chosen, cnt=count: on_done(
+                            self._post_ui(lambda c=chosen, cnt=count: on_done(
                                 c, [(c, cnt, c["description"])]))
                             return
-                        self.root.after(0, lambda: on_progress(
+                        self._post_ui(lambda: on_progress(
                             "warn", "Loopback 沒收到遊戲封包", "改用一般網卡掃描"))
 
                 try:
                     raw_ifs = list_network_ifaces()
                 except Exception as e:
-                    self.root.after(0, lambda err=e: on_progress(
+                    self._post_ui(lambda err=e: on_progress(
                         "warn", f"無法列出介面: {err}"))
-                    self.root.after(0, lambda: on_done(None, []))
+                    self._post_ui(lambda: on_done(None, []))
                     return
 
                 ifs = [i for i in raw_ifs if _extract_ipv4(i.get("ips"))]
                 ifs = [i for i in ifs if not _is_never_game_traffic(i.get("name"))]
                 if not ifs:
-                    self.root.after(0, lambda: on_progress(
+                    self._post_ui(lambda: on_progress(
                         "warn", "沒有可掃描的介面 (無介面有有效 IPv4)"))
-                    self.root.after(0, lambda: on_done(None, []))
+                    self._post_ui(lambda: on_done(None, []))
                     return
 
                 # 預設路由那張排最前面:絕大多數情況遊戲就走這張,先掃到就能提早收工
@@ -2296,7 +2318,7 @@ class LiveDamageMonitor:
                 ifs.sort(key=lambda i: i.get("name") != preferred)
 
                 total_time = len(ifs) * per_iface_timeout
-                self.root.after(0, lambda: on_progress(
+                self._post_ui(lambda: on_progress(
                     "info", f"開始掃描 {len(ifs)} 張介面,每張測 {per_iface_timeout} 秒 (最多約 {total_time} 秒)"))
 
                 hits = []
@@ -2308,31 +2330,31 @@ class LiveDamageMonitor:
                                       timeout=per_iface_timeout, store=True)
                         count = len(pkts)
                     except Exception as e:
-                        self.root.after(0, lambda n=name, err=e: on_progress(
+                        self._post_ui(lambda n=name, err=e: on_progress(
                             "warn", f"{n}", f"sniff 失敗: {err}"))
                         continue
 
                     if count > 0:
                         hits.append((iface, count, name))
-                        self.root.after(0, lambda n=name, c=count: on_progress(
+                        self._post_ui(lambda n=name, c=count: on_progress(
                             "ok", f"✓ {n}", f"收到 {c} 個目標封包"))
                         # 預設路由那張已經收到流量就不必再試其他張,省下數十秒
                         # (macOS 上虛擬介面動輒十幾張,全掃完使用者早就等到不耐煩)
                         if iface_key == preferred:
                             break
                     else:
-                        self.root.after(0, lambda n=name: on_progress(
+                        self._post_ui(lambda n=name: on_progress(
                             "info", f"  {n}", "沒收到"))
 
                 if not hits:
-                    self.root.after(0, lambda: on_done(None, []))
+                    self._post_ui(lambda: on_done(None, []))
                 else:
                     best = max(hits, key=lambda x: x[1])
-                    self.root.after(0, lambda b=best: on_done(b[0], hits))
+                    self._post_ui(lambda b=best: on_done(b[0], hits))
             except Exception as e:
-                self.root.after(0, lambda err=e: on_progress(
+                self._post_ui(lambda err=e: on_progress(
                     "warn", f"掃描發生錯誤: {err}"))
-                self.root.after(0, lambda: on_done(None, []))
+                self._post_ui(lambda: on_done(None, []))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -2469,7 +2491,7 @@ class LiveDamageMonitor:
                 rc, err = proc.returncode, (proc.stderr or "").strip()
             except Exception as e:
                 rc, err = -1, str(e)
-            self.root.after(0, lambda: self._on_bpf_setup_done(rc, err))
+            self._post_ui(lambda: self._on_bpf_setup_done(rc, err))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -3720,7 +3742,7 @@ class LiveDamageMonitor:
         if target_id in self.target_stats:
             return
         self.target_order.append(target_id)
-        self.root.after(0, self._refresh_target_options)
+        self._post_ui(self._refresh_target_options)
 
     def _target_label(self, key):
         """目標按鈕文字:登場包 (0x4E4C) 認得出來就顯示怪物名,否則退回 0x + 8 碼 hex。
@@ -3973,7 +3995,7 @@ class LiveDamageMonitor:
         self._ident_no_id_logged = False  # 攻擊日誌的紅字本場是否已寫過
 
     def _ident_log(self, msg):
-        self.root.after(0, lambda m=msg: self.dev_log(m))
+        self._post_ui(lambda m=msg: self.dev_log(m))
 
     def _ident_notify_ok(self):
         """首次取得角色 ID 時寫一行綠字 (由 sniff 執行緒呼叫,故走 after)。
@@ -3984,7 +4006,7 @@ class LiveDamageMonitor:
         if self._ident_ok_logged:
             return
         self._ident_ok_logged = True
-        self.root.after(0, lambda: self._append_log(IDENT_MSG_OK, color="ident_ok"))
+        self._post_ui(lambda: self._append_log(IDENT_MSG_OK, color="ident_ok"))
 
     def _ident_warn_no_id(self):
         """尚未取得角色 ID → 紅字提醒 (本場只寫一次)。"""
@@ -3992,7 +4014,7 @@ class LiveDamageMonitor:
             return
         self._ident_no_id_logged = True
         msg = IDENT_MSG_NONE if _BROTLI is not None else IDENT_MSG_NO_BROTLI
-        self.root.after(0, lambda m=msg: self.log_error(m))
+        self._post_ui(lambda m=msg: self.log_error(m))
 
     def _ident_status_line(self):
         """啟動 / 按「開始」/ 按「清除」時的狀態提示 (主執行緒)。
@@ -4282,7 +4304,7 @@ class LiveDamageMonitor:
         self._mob_n_round2 = 0     # 第一輪沒中、第二輪(只認前哨)卻查到名字的次數
 
     def _mob_log(self, msg):
-        self.root.after(0, lambda m=msg: self.dev_log(m))
+        self._post_ui(lambda m=msg: self.dev_log(m))
 
     def _mob_note(self, msg):
         """詳細行有上限 — 一場幾十隻怪,不設限會把其他診斷洗掉。"""
@@ -4467,7 +4489,7 @@ class LiveDamageMonitor:
             self._entity_names.popitem(last=False)
         # 這隻可能已經在目標列上了 (傷害先到 / 名字晚到),同名第二隻出現時
         # 也要回頭把第一隻的序號補上 → 一律重刷文字,不重建 widget。
-        self.root.after(0, self._refresh_target_labels)
+        self._post_ui(self._refresh_target_labels)
 
     @staticmethod
     def _mob_find_code(plain, head_only=False):
@@ -4527,7 +4549,7 @@ class LiveDamageMonitor:
         self._buff_lines = 0       # 已印的詳細行數 (上限 BUFF_LOG_MAX)
 
     def _buff_log(self, msg):
-        self.root.after(0, lambda m=msg: self.dev_log(m))
+        self._post_ui(lambda m=msg: self.dev_log(m))
 
     def _buff_note(self, msg):
         """詳細行有上限 — 一場下來 buff 事件不少,不設限會把其他診斷洗掉。
@@ -4796,7 +4818,7 @@ class LiveDamageMonitor:
                         if dmg_val == 0xFFFFFFFF:
                             if is_self_hit:
                                 msg = "🛡️ [傷害免疫] 數值: 免疫 (0xFFFFFFFF)"
-                                self.root.after(0, lambda m=msg, tid=target_id:
+                                self._post_ui(lambda m=msg, tid=target_id:
                                                 self.log_damage(m, (), tid))
                             offset += (size + 8) if size > 0 else 35
                             continue
@@ -4871,7 +4893,7 @@ class LiveDamageMonitor:
                                        f"攻擊者:0x{attacker_id:08X} → 目標:0x{target_id:08X} | "
                                        f"flags[41-47]: {flags_txt} | b57:{b57:02X} | "
                                        f"技能: {skill_txt}{dot_txt}{cand_txt}")
-                            self.root.after(0, lambda m=dev_msg: self.dev_log(m))
+                            self._post_ui(lambda m=dev_msg: self.dev_log(m))
 
                         # 2.4 統計門檻:只記錄自己打出去的傷害。
                         #     還沒認出自己的實體 ID 前一律不記 —— 沒有身分就無從分辨
@@ -5007,7 +5029,7 @@ class LiveDamageMonitor:
                         # 只有這筆會影響到「目前顯示中的目標」時才重畫
                         # (連攜沒動到任何統計桶,重畫出來會一模一樣)
                         if not chain_cut and self.selected_target in (TARGET_ALL, target_id):
-                            self.root.after(0, self._refresh_stats_view)
+                            self._post_ui(self._refresh_stats_view)
 
                         # 技能欄:優先用 skills.ini 對照,skill_id=0 標為符文,否則顯示 hex ID
                         #        DoT 加註 (Dot)、持續傷害加註 (間接) — 兩者旗標都來自
@@ -5027,7 +5049,7 @@ class LiveDamageMonitor:
                         # 行首多一個 tab:傷害值靠第一個 (right) 停靠點右對齊,
                         # 不再補空白 — 補空白只在等寬字體下才對得齊。
                         msg = f"\t{dmg_val:,}\t{tag_str}\t{skill_display}"
-                        self.root.after(0, lambda m=msg, t=list(tags), tid=target_id,
+                        self._post_ui(lambda m=msg, t=list(tags), tid=target_id,
                                         c="chain" if is_chain else None:
                                         self.log_damage(m, t, tid, color=c))
 
@@ -5115,7 +5137,7 @@ class LiveDamageMonitor:
             if len(candidates) == 1:
                 tid = next(iter(candidates))
                 self.local_player_id = tid
-                self.root.after(0, lambda t=tid: self.log_heal(
+                self._post_ui(lambda t=tid: self.log_heal(
                     f"⭐ 已識別本地玩家 ID: 0x{t:X}"))
 
         # Shield 事件 (統計只寫日誌,不進 banner)
@@ -5126,7 +5148,7 @@ class LiveDamageMonitor:
             skill_part = self._skill_label(skill_id)
             detail = "" if tag == "heal_self" else f"  → 0x{target_id:X}"
             msg = f"[{prefix}] {skill_part}+{amount:,}{detail}"
-            self.root.after(0, lambda m=msg, t=tag: self.log_heal(m, tag=t))
+            self._post_ui(lambda m=msg, t=tag: self.log_heal(m, tag=t))
 
         # Heal 事件 (banner 累加)
         for tlv_start, target_id, heal_val in heals:
@@ -5142,10 +5164,10 @@ class LiveDamageMonitor:
             skill_part = self._skill_label(skill_id)
             detail = "" if tag == "heal_self" else f"  → 0x{target_id:X}"
             msg = f"[{prefix}] {skill_part}+{heal_val:,}{detail}"
-            self.root.after(0, lambda m=msg, t=tag: self.log_heal(m, tag=t))
+            self._post_ui(lambda m=msg, t=tag: self.log_heal(m, tag=t))
 
         if heals:
-            self.root.after(0, self._update_heal_banner)
+            self._post_ui(self._update_heal_banner)
 
     def _classify_target(self, target_id):
         """依 local_player_id 判定 target 的分類。
@@ -5351,11 +5373,11 @@ class LiveDamageMonitor:
             try:
                 sniff(promisc=False, **sniff_kwargs)
             except Exception as e:
-                self.root.after(0, lambda err=e: self.log(
+                self._post_ui(lambda err=e: self.log(
                     f"⚠️ 非 promiscuous 模式擷取失敗 ({err}),改用預設模式重試"))
                 sniff(**sniff_kwargs)
         except Exception as e:
-            self.root.after(0, lambda err=e: self.log(f"❌ 攔截錯誤: {err}"))
+            self._post_ui(lambda err=e: self.log(f"❌ 攔截錯誤: {err}"))
 
     def start_monitoring(self):
         self.is_monitoring = True
