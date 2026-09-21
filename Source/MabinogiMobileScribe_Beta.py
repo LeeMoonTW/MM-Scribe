@@ -34,6 +34,7 @@ import csv
 import io
 import json
 import os
+import queue
 import struct
 import subprocess
 import sys
@@ -140,7 +141,8 @@ SETTINGS_CFG_NAME = "settings.ini"
 DEFAULT_GAME_PROCESSES = ("mabinogimobile.exe",)
 # 存檔 (「紀錄 / 讀取」):檔案放在 EXE (或原始碼) 旁的 Save/ 資料夾
 SAVE_DIR_NAME = "Save"
-SAVE_FILE_PREFIX = "MMScribe_"
+SAVE_FILE_PREFIX = "MM_"
+SAVE_FILE_PREFIXES = (SAVE_FILE_PREFIX, "MMScribe_")  # 新格式 + 舊版存檔
 SAVE_FILE_EXT = ".json"
 # 存檔格式版號。欄位語意變動時 +1;讀檔遇到不認得的版號直接拒讀,
 # 免得舊檔被當成新格式塞進 target_stats,畫面數字錯得無聲無息。
@@ -151,6 +153,25 @@ FONT_SCALE_MIN = 1.0
 FONT_SCALE_MAX = 2.0
 FONT_SCALE_DEFAULT = 1.0
 MERGE_GROUP_SECTION = "合併群組"
+JOB_ABBREVIATIONS = {
+    "戰士": "WAR",
+    "大劍戰士": "GSW",
+    "劍術士": "SWD",
+    "魔法師": "MAG",
+    "冰霜術士": "ICE",
+    "弓箭手": "ARC",
+    "長弓兵": "LBG",
+    "弩手": "XBW",
+    "祭司": "PRI",
+    "修道士": "MNK",
+    "吟遊詩人": "BRD",
+    "樂師": "MUS",
+    "舞者": "DNC",
+    "雙刀客": "DBL",
+    "治癒師": "HLR",
+    "寵物": "PET",
+    "未分類": "UNK",
+}
 # 註:舊版的「忽略寵物攻擊」設定已移除 — 統計改用角色 ID 門檻 (只收攻擊者 == 自己的
 # 傷害),寵物是獨立實體,本來就不會進統計。skills.ini 的 [寵物] 區段仍照常提供技能名。
 # Skill ID 提取 (見 HEAL_SHIELD_SKILL_ID.md §4)
@@ -598,8 +619,9 @@ def load_skill_config():
 
     後綴僅為註記,所有合併群組區段共用同一命名空間;群組名跨區段重複時會觸發衝突。
 
-    回傳 (skill_names, merge_groups, conflicts, errors)
+    回傳 (skill_names, skill_jobs, merge_groups, conflicts, errors)
       - skill_names:  dict[int skill_id, str display_name]
+      - skill_jobs:   dict[int skill_id, str job_name]
       - merge_groups: dict[str member_name, str group_name]
       - conflicts:    list[(member, first_group, ignored_group)] 供 UI 提示
       - errors:       list[str] 解析過程中的錯誤訊息 (檔案級 or 逐行) 供 UI 顯示
@@ -607,7 +629,7 @@ def load_skill_config():
     """
     path = get_external_path(SKILL_CFG_NAME)
     if not os.path.exists(path):
-        return {}, {}, [], []
+        return {}, {}, {}, [], []
     errors = []
     parser = configparser.ConfigParser()
     parser.optionxform = str  # 保留原大小寫,避免 0x64D 被轉小寫影響閱讀
@@ -615,23 +637,24 @@ def load_skill_config():
         parser.read(path, encoding="utf-8")
     except configparser.DuplicateOptionError as e:
         errors.append(f"重複的 key:[{e.section}] '{e.option}' (第 {e.lineno} 行) — INI 同一區段內不允許同名 key")
-        return {}, {}, [], errors
+        return {}, {}, {}, [], errors
     except configparser.DuplicateSectionError as e:
         errors.append(f"重複的區段:[{e.section}] (第 {e.lineno} 行)")
-        return {}, {}, [], errors
+        return {}, {}, {}, [], errors
     except configparser.MissingSectionHeaderError as e:
         errors.append(f"缺少區段標頭:第 {e.lineno} 行 '{e.line.strip()}' — 檔案開頭必須先有 [區段名]")
-        return {}, {}, [], errors
+        return {}, {}, {}, [], errors
     except configparser.ParsingError as e:
         errors.append(f"解析錯誤:{e}")
-        return {}, {}, [], errors
+        return {}, {}, {}, [], errors
     except UnicodeDecodeError as e:
         errors.append(f"編碼錯誤:檔案不是 UTF-8 (byte {e.start}: {e.reason}) — 請以 UTF-8 存檔")
-        return {}, {}, [], errors
+        return {}, {}, {}, [], errors
     except Exception as e:
         errors.append(f"未預期錯誤:{type(e).__name__}: {e}")
-        return {}, {}, [], errors
+        return {}, {}, {}, [], errors
     names = {}
+    jobs = {}
     groups = {}
     conflicts = []
 
@@ -667,12 +690,13 @@ def load_skill_config():
             name = value.strip()
             if name:
                 names[skill_id] = name
-    return names, groups, conflicts, errors
+                jobs[skill_id] = section.strip()
+    return names, jobs, groups, conflicts, errors
 
 
 # 每次按下「開始」都會重新讀取 (見 start_monitoring)
 # 開程式時預先載一次,方便主程式建立初始狀態
-SKILL_NAMES, MERGE_GROUPS, _, _ = load_skill_config()
+SKILL_NAMES, SKILL_JOBS, MERGE_GROUPS, _, _ = load_skill_config()
 
 
 def load_effect_names():
@@ -1176,8 +1200,29 @@ ctk.set_default_color_theme("dark-blue")
 
 
 class LiveDamageMonitor:
+    def _post_ui(self, callback):
+        """Queue UI work without calling Tcl/Tk from a worker thread."""
+        self._ui_callbacks.put(callback)
+
+    def _drain_ui_callbacks(self):
+        """Run queued callbacks on the Tk thread, yielding between batches."""
+        try:
+            for _ in range(200):
+                try:
+                    callback = self._ui_callbacks.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    callback()
+                except Exception:
+                    self.root.report_callback_exception(*sys.exc_info())
+        finally:
+            self.root.after(25, self._drain_ui_callbacks)
+
     def __init__(self, root):
         self.root = root
+        self._ui_callbacks = queue.SimpleQueue()
+        self.root.after(25, self._drain_ui_callbacks)
 
         # 讀設定並在建立任何 widget 前先套用縮放 (widget/window scaling 都是全域狀態,
         # 提前設好 CTk 建立的元件會直接以正確尺寸誕生,不必事後重排)
@@ -1668,6 +1713,35 @@ class LiveDamageMonitor:
         self.ctrl_row4 = ctk.CTkFrame(root, corner_radius=0)
         self.ctrl_row4.pack(side="bottom", fill="x", padx=10, pady=(0, 3))
         ctrl_row4 = self.ctrl_row4  # local alias,與其他控制列一致
+
+        # 存檔命名列。留空的欄位不會產生多餘的底線。
+        self.save_name_row = ctk.CTkFrame(root, corner_radius=0)
+        self.save_name_row.pack(side="bottom", fill="x", padx=10, pady=(0, 3))
+        self.save_tag_var = tk.StringVar()
+        self.save_avoid_duplicate_var = tk.BooleanVar(value=True)
+        self.save_timestamp_var = tk.BooleanVar(value=True)
+        self.save_job_var = tk.BooleanVar(value=True)
+        self.save_tag_enabled_var = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            self.save_name_row, text="避免重覆LOG",
+            variable=self.save_avoid_duplicate_var, width=104).pack(
+                side="left", padx=(8, 2), pady=6)
+        self.save_timestamp_check = ctk.CTkCheckBox(
+            self.save_name_row, text="自動日期", variable=self.save_timestamp_var,
+            width=82)
+        self.save_timestamp_check.pack(side="left", padx=2, pady=6)
+        ctk.CTkCheckBox(
+            self.save_name_row, text="自動職業", variable=self.save_job_var,
+            width=82).pack(side="left", padx=2, pady=6)
+        ctk.CTkCheckBox(
+            self.save_name_row, text="標籤", variable=self.save_tag_enabled_var,
+            command=self._toggle_save_tag, width=58).pack(
+                side="left", padx=2, pady=6)
+        self.save_tag_entry = ctk.CTkEntry(
+            self.save_name_row, textvariable=self.save_tag_var,
+            placeholder_text="tag", width=105)
+        self.save_tag_entry.pack(
+            side="left", padx=2, pady=6)
 
         self.btn_save = ctk.CTkButton(ctrl_row4, text="💾 紀錄", width=70, corner_radius=8,
                                       fg_color="#5a7a9a", hover_color="#6a8aaa",
@@ -2197,7 +2271,7 @@ class LiveDamageMonitor:
 
         # 依當前佈局重算 minsize,確保 status_bar 不會被 log/skill/heal 這些
         # expand=True 的面板擠掉。用 after(0) 讓 Tk 完成本次 pack 再量高度
-        self.root.after(0, self._refresh_minsize)
+        self._post_ui(self._refresh_minsize)
 
     def _refresh_minsize(self):
         """依「當前顯示的 banner + 4 條控制列 + status_bar」總高度,
@@ -2209,6 +2283,7 @@ class LiveDamageMonitor:
         """
         self.root.update_idletasks()
         parts = [self.ctrl_row1, self.ctrl_row2, self.ctrl_row3, self.ctrl_row4,
+                 self.save_name_row,
                  self.status_bar]
         # 底部診斷區塊是常駐的 (發布版除外),最小高度要把它算進去
         if self.dev_strip.winfo_manager():
@@ -2382,7 +2457,7 @@ class LiveDamageMonitor:
                            + " or ".join(f"port {p}" for p in sorted(ports)) + ")")
                     lo = find_loopback_iface()
                     if lo is None:
-                        self.root.after(0, lambda d=pdesc: on_progress(
+                        self._post_ui(lambda d=pdesc: on_progress(
                             "warn", f"偵測到本機網路代理 ({d}),但找不到 Loopback 擷取介面",
                             "請重新安裝 Npcap 並勾選「Support loopback traffic」",
                             "先改用一般網卡掃描"))
@@ -2390,7 +2465,7 @@ class LiveDamageMonitor:
                         lo_name = str(lo.get("description") or lo.get("name") or "Loopback")
                         # 用 active 而非 info:這是要讓使用者看到的狀態切換,
                         # info 會被啟動流程的日誌過濾當成逐張網卡的細節擋掉
-                        self.root.after(0, lambda d=pdesc, p=port_str: on_progress(
+                        self._post_ui(lambda d=pdesc, p=port_str: on_progress(
                             "active", f"偵測到本機網路代理 ({d})",
                             f"遊戲連線被接到本機 port {p},改掃 Loopback"))
                         count = 0
@@ -2401,36 +2476,36 @@ class LiveDamageMonitor:
                                                timeout=max(per_iface_timeout, 3),
                                                store=True))
                         except Exception as e:
-                            self.root.after(0, lambda n=lo_name, err=e: on_progress(
+                            self._post_ui(lambda n=lo_name, err=e: on_progress(
                                 "warn", f"{n}", f"sniff 失敗: {err}"))
                         if count > 0:
                             chosen = dict(lo)
                             chosen["description"] = (
                                 f"Loopback 代理模式 — {pdesc} (port {port_str})")
                             chosen["_filter"] = flt
-                            self.root.after(0, lambda d=chosen["description"], c=count:
+                            self._post_ui(lambda d=chosen["description"], c=count:
                                             on_progress("ok", f"✓ {d}",
                                                         f"收到 {c} 個目標封包"))
-                            self.root.after(0, lambda c=chosen, cnt=count: on_done(
+                            self._post_ui(lambda c=chosen, cnt=count: on_done(
                                 c, [(c, cnt, c["description"])]))
                             return
-                        self.root.after(0, lambda: on_progress(
+                        self._post_ui(lambda: on_progress(
                             "warn", "Loopback 沒收到遊戲封包", "改用一般網卡掃描"))
 
                 try:
                     raw_ifs = list_network_ifaces()
                 except Exception as e:
-                    self.root.after(0, lambda err=e: on_progress(
+                    self._post_ui(lambda err=e: on_progress(
                         "warn", f"無法列出介面: {err}"))
-                    self.root.after(0, lambda: on_done(None, []))
+                    self._post_ui(lambda: on_done(None, []))
                     return
 
                 ifs = [i for i in raw_ifs if _extract_ipv4(i.get("ips"))]
                 ifs = [i for i in ifs if not _is_never_game_traffic(i.get("name"))]
                 if not ifs:
-                    self.root.after(0, lambda: on_progress(
+                    self._post_ui(lambda: on_progress(
                         "warn", "沒有可掃描的介面 (無介面有有效 IPv4)"))
-                    self.root.after(0, lambda: on_done(None, []))
+                    self._post_ui(lambda: on_done(None, []))
                     return
 
                 # 預設路由那張排最前面:絕大多數情況遊戲就走這張,先掃到就能提早收工
@@ -2438,7 +2513,7 @@ class LiveDamageMonitor:
                 ifs.sort(key=lambda i: i.get("name") != preferred)
 
                 total_time = len(ifs) * per_iface_timeout
-                self.root.after(0, lambda: on_progress(
+                self._post_ui(lambda: on_progress(
                     "info", f"開始掃描 {len(ifs)} 張介面,每張測 {per_iface_timeout} 秒 (最多約 {total_time} 秒)"))
 
                 hits = []
@@ -2450,31 +2525,31 @@ class LiveDamageMonitor:
                                       timeout=per_iface_timeout, store=True)
                         count = len(pkts)
                     except Exception as e:
-                        self.root.after(0, lambda n=name, err=e: on_progress(
+                        self._post_ui(lambda n=name, err=e: on_progress(
                             "warn", f"{n}", f"sniff 失敗: {err}"))
                         continue
 
                     if count > 0:
                         hits.append((iface, count, name))
-                        self.root.after(0, lambda n=name, c=count: on_progress(
+                        self._post_ui(lambda n=name, c=count: on_progress(
                             "ok", f"✓ {n}", f"收到 {c} 個目標封包"))
                         # 預設路由那張已經收到流量就不必再試其他張,省下數十秒
                         # (macOS 上虛擬介面動輒十幾張,全掃完使用者早就等到不耐煩)
                         if iface_key == preferred:
                             break
                     else:
-                        self.root.after(0, lambda n=name: on_progress(
+                        self._post_ui(lambda n=name: on_progress(
                             "info", f"  {n}", "沒收到"))
 
                 if not hits:
-                    self.root.after(0, lambda: on_done(None, []))
+                    self._post_ui(lambda: on_done(None, []))
                 else:
                     best = max(hits, key=lambda x: x[1])
-                    self.root.after(0, lambda b=best: on_done(b[0], hits))
+                    self._post_ui(lambda b=best: on_done(b[0], hits))
             except Exception as e:
-                self.root.after(0, lambda err=e: on_progress(
+                self._post_ui(lambda err=e: on_progress(
                     "warn", f"掃描發生錯誤: {err}"))
-                self.root.after(0, lambda: on_done(None, []))
+                self._post_ui(lambda: on_done(None, []))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -2611,7 +2686,7 @@ class LiveDamageMonitor:
                 rc, err = proc.returncode, (proc.stderr or "").strip()
             except Exception as e:
                 rc, err = -1, str(e)
-            self.root.after(0, lambda: self._on_bpf_setup_done(rc, err))
+            self._post_ui(lambda: self._on_bpf_setup_done(rc, err))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -3910,7 +3985,7 @@ class LiveDamageMonitor:
         if target_id in self.target_stats:
             return
         self.target_order.append(target_id)
-        self.root.after(0, self._refresh_target_options)
+        self._post_ui(self._refresh_target_options)
 
     def _target_label(self, key):
         """目標按鈕文字:登場包 (0x4E4C) 認得出來就顯示怪物名,否則退回 0x + 8 碼 hex。
@@ -4163,7 +4238,7 @@ class LiveDamageMonitor:
         self._ident_no_id_logged = False  # 攻擊日誌的紅字本場是否已寫過
 
     def _ident_log(self, msg):
-        self.root.after(0, lambda m=msg: self.dev_log(m))
+        self._post_ui(lambda m=msg: self.dev_log(m))
 
     def _ident_notify_ok(self):
         """首次取得角色 ID 時寫一行綠字 (由 sniff 執行緒呼叫,故走 after)。
@@ -4174,7 +4249,7 @@ class LiveDamageMonitor:
         if self._ident_ok_logged:
             return
         self._ident_ok_logged = True
-        self.root.after(0, lambda: self._append_log(IDENT_MSG_OK, color="ident_ok"))
+        self._post_ui(lambda: self._append_log(IDENT_MSG_OK, color="ident_ok"))
 
     def _ident_warn_no_id(self):
         """尚未取得角色 ID → 紅字提醒 (本場只寫一次)。"""
@@ -4182,7 +4257,7 @@ class LiveDamageMonitor:
             return
         self._ident_no_id_logged = True
         msg = IDENT_MSG_NONE if _BROTLI is not None else IDENT_MSG_NO_BROTLI
-        self.root.after(0, lambda m=msg: self.log_error(m))
+        self._post_ui(lambda m=msg: self.log_error(m))
 
     def _ident_status_line(self):
         """啟動 / 按「開始」/ 按「清除」時的狀態提示 (主執行緒)。
@@ -4472,7 +4547,7 @@ class LiveDamageMonitor:
         self._mob_n_round2 = 0     # 第一輪沒中、第二輪(只認前哨)卻查到名字的次數
 
     def _mob_log(self, msg):
-        self.root.after(0, lambda m=msg: self.dev_log(m))
+        self._post_ui(lambda m=msg: self.dev_log(m))
 
     def _mob_note(self, msg):
         """詳細行有上限 — 一場幾十隻怪,不設限會把其他診斷洗掉。"""
@@ -4664,7 +4739,7 @@ class LiveDamageMonitor:
             self._entity_names.popitem(last=False)
         # 這隻可能已經在目標列上了 (傷害先到 / 名字晚到),同名第二隻出現時
         # 也要回頭把第一隻的序號補上 → 一律重刷文字,不重建 widget。
-        self.root.after(0, self._refresh_target_labels)
+        self._post_ui(self._refresh_target_labels)
 
     @staticmethod
     def _mob_find_code(plain, head_only=False):
@@ -4724,7 +4799,7 @@ class LiveDamageMonitor:
         self._buff_lines = 0       # 已印的詳細行數 (上限 BUFF_LOG_MAX)
 
     def _buff_log(self, msg):
-        self.root.after(0, lambda m=msg: self.dev_log(m))
+        self._post_ui(lambda m=msg: self.dev_log(m))
 
     def _buff_note(self, msg):
         """詳細行有上限 — 一場下來 buff 事件不少,不設限會把其他診斷洗掉。
@@ -5302,9 +5377,9 @@ class LiveDamageMonitor:
             return
         self._gauge_lines += 1
         if self._gauge_lines <= GAUGE_LOG_MAX:
-            self.root.after(0, lambda m=msg: self.dev_log(m))
+            self._post_ui(lambda m=msg: self.dev_log(m))
         elif self._gauge_lines == GAUGE_LOG_MAX + 1:
-            self.root.after(0, lambda: self.dev_log(
+            self._post_ui(lambda: self.dev_log(
                 f"[Gauge] 已達 {GAUGE_LOG_MAX} 行上限,停止輸出"))
 
     def _buff_scan(self, payload):
@@ -5538,7 +5613,7 @@ class LiveDamageMonitor:
                         if dmg_val == 0xFFFFFFFF:
                             if is_self_hit:
                                 msg = "🛡️ [傷害免疫] 數值: 免疫 (0xFFFFFFFF)"
-                                self.root.after(0, lambda m=msg, tid=target_id:
+                                self._post_ui(lambda m=msg, tid=target_id:
                                                 self.log_damage(m, (), tid))
                             offset += (size + 8) if size > 0 else 35
                             continue
@@ -5613,7 +5688,7 @@ class LiveDamageMonitor:
                                        f"攻擊者:0x{attacker_id:08X} → 目標:0x{target_id:08X} | "
                                        f"flags[41-47]: {flags_txt} | b57:{b57:02X} | "
                                        f"技能: {skill_txt}{dot_txt}{cand_txt}")
-                            self.root.after(0, lambda m=dev_msg: self.dev_log(m))
+                            self._post_ui(lambda m=dev_msg: self.dev_log(m))
 
                         # 2.4 統計門檻:只記錄自己打出去的傷害。
                         #     還沒認出自己的實體 ID 前一律不記 —— 沒有身分就無從分辨
@@ -5783,7 +5858,7 @@ class LiveDamageMonitor:
                         # 只有這筆會影響到「目前顯示中的目標」時才重畫
                         # (連攜沒動到任何統計桶,重畫出來會一模一樣)
                         if not chain_cut and self.selected_target in (TARGET_ALL, target_id):
-                            self.root.after(0, self._refresh_stats_view)
+                            self._post_ui(self._refresh_stats_view)
 
                         # 技能欄:優先用 skills.ini 對照,skill_id=0 標為符文,否則顯示 hex ID
                         #        DoT 加註 (Dot)、持續傷害加註 (間接) — 兩者旗標都來自
@@ -5808,7 +5883,7 @@ class LiveDamageMonitor:
                         brk_txt = (LOG_BRK_NONE if brk_delta is None
                                    else f"{brk_delta:.1f}")
                         msg = f"\t{dmg_val:,}\t{tag_str}\t{skill_display}"
-                        self.root.after(0, lambda m=msg, t=list(tags), tid=target_id,
+                        self._post_ui(lambda m=msg, t=list(tags), tid=target_id,
                                         b=brk_txt,
                                         c="chain" if is_chain else None:
                                         self.log_damage(m, t, tid, color=c, brk=b))
@@ -5897,7 +5972,7 @@ class LiveDamageMonitor:
             if len(candidates) == 1:
                 tid = next(iter(candidates))
                 self.local_player_id = tid
-                self.root.after(0, lambda t=tid: self.log_heal(
+                self._post_ui(lambda t=tid: self.log_heal(
                     f"⭐ 已識別本地玩家 ID: 0x{t:X}"))
 
         # Shield 事件 (統計只寫日誌,不進 banner)
@@ -5908,7 +5983,7 @@ class LiveDamageMonitor:
             skill_part = self._skill_label(skill_id)
             detail = "" if tag == "heal_self" else f"  → 0x{target_id:X}"
             msg = f"[{prefix}] {skill_part}+{amount:,}{detail}"
-            self.root.after(0, lambda m=msg, t=tag: self.log_heal(m, tag=t))
+            self._post_ui(lambda m=msg, t=tag: self.log_heal(m, tag=t))
 
         # Heal 事件 (banner 累加)
         for tlv_start, target_id, heal_val in heals:
@@ -5924,10 +5999,10 @@ class LiveDamageMonitor:
             skill_part = self._skill_label(skill_id)
             detail = "" if tag == "heal_self" else f"  → 0x{target_id:X}"
             msg = f"[{prefix}] {skill_part}+{heal_val:,}{detail}"
-            self.root.after(0, lambda m=msg, t=tag: self.log_heal(m, tag=t))
+            self._post_ui(lambda m=msg, t=tag: self.log_heal(m, tag=t))
 
         if heals:
-            self.root.after(0, self._update_heal_banner)
+            self._post_ui(self._update_heal_banner)
 
     def _classify_target(self, target_id):
         """依 local_player_id 判定 target 的分類。
@@ -6137,11 +6212,11 @@ class LiveDamageMonitor:
             try:
                 sniff(promisc=False, **sniff_kwargs)
             except Exception as e:
-                self.root.after(0, lambda err=e: self.log(
+                self._post_ui(lambda err=e: self.log(
                     f"⚠️ 非 promiscuous 模式擷取失敗 ({err}),改用預設模式重試"))
                 sniff(**sniff_kwargs)
         except Exception as e:
-            self.root.after(0, lambda err=e: self.log(f"❌ 攔截錯誤: {err}"))
+            self._post_ui(lambda err=e: self.log(f"❌ 攔截錯誤: {err}"))
 
     def start_monitoring(self):
         self.is_monitoring = True
@@ -6150,8 +6225,8 @@ class LiveDamageMonitor:
         self.btn_stop.configure(state="normal", fg_color="#d63031", hover_color="#b02a2c")
 
         # 每次按下開始都重新讀取 skills.ini,讓使用者修改後不用重啟程式
-        global SKILL_NAMES, MERGE_GROUPS
-        SKILL_NAMES, MERGE_GROUPS, conflicts, ini_errors = load_skill_config()
+        global SKILL_NAMES, SKILL_JOBS, MERGE_GROUPS
+        SKILL_NAMES, SKILL_JOBS, MERGE_GROUPS, conflicts, ini_errors = load_skill_config()
         if ini_errors:
             self.log_error(f"❌ 載入 {SKILL_CFG_NAME} 時發生錯誤:")
             for err in ini_errors:
@@ -6512,21 +6587,97 @@ class LiveDamageMonitor:
             "log_entries": entries,
         }
 
+    def _toggle_save_tag(self):
+        """標籤未勾選時停用輸入欄。"""
+        self.save_tag_entry.configure(
+            state="normal" if self.save_tag_enabled_var.get() else "disabled")
+
+    def _detected_job_name(self):
+        """依本場已記錄的技能判斷職業;連攜傷害屬於隊友,不拿來判斷。"""
+        counts = collections.Counter()
+        for _ts, _target_id, skill_id, _damage, flags in self.damage_events:
+            if skill_id is None or flags & DMG_EVENT_CHAIN_BIT:
+                continue
+            job = SKILL_JOBS.get(skill_id)
+            if job:
+                counts[job] += 1
+        if not counts:
+            return "UNK"
+        return JOB_ABBREVIATIONS.get(counts.most_common(1)[0][0], "UNK")
+
     def save_snapshot(self):
-        """把當前所有統計寫成 Save/MMScribe_<日期時間>.json。
-        檔名用 %Y%m%d_%H%M%S:字串排序即時間排序,且不含 Windows 禁用的 ':'。
-        """
+        """把當前統計寫進 Save/,並避免同一份日誌被重複存檔。"""
         try:
             data = self._snapshot_dict()
         except Exception as exc:
             self.log_error(f"❌ 建立存檔內容失敗:{exc}")
             return
+
+        # saved_at 每次都不同;「已存檔」提示也是存檔動作本身產生的,兩者都不能
+        # 用來判斷內容是否有更新。其餘日誌內容相同就視為同一份紀錄。
+        ignored_save_messages = ("=== 已存檔 ", "=== 已讀取存檔 ",
+                                 "=== 純檢視模式:",
+                                 "⚠️ 日誌內容沒有更新,未重複存檔",
+                                 "⚠️ 日誌內容與最近存檔 ")
+        def log_signature(entries):
+            meaningful = [entry for entry in entries
+                          if not str(entry.get("text", "")).startswith(
+                              ignored_save_messages)]
+            return json.dumps(meaningful, ensure_ascii=False, sort_keys=True,
+                              separators=(",", ":"))
+
+        signature = log_signature(data["log_entries"])
+
         save_dir = get_save_dir()
-        name = SAVE_FILE_PREFIX + time.strftime("%Y%m%d_%H%M%S")
+        # Windows 與 macOS 都能安全使用的檔名;不可用字元以底線取代。
+        def clean_part(value):
+            value = "".join("_" if ord(ch) < 32 or ch in '<>:"/\\|?*' else ch
+                            for ch in value.strip())
+            return value.strip(" ._")
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        parts = []
+        if self.save_timestamp_var.get():
+            parts.append(timestamp)
+        if self.save_job_var.get():
+            parts.append(clean_part(self._detected_job_name()))
+        if self.save_tag_enabled_var.get():
+            tag = clean_part(self.save_tag_var.get())
+            if tag:
+                parts.append(tag)
+        if not parts:
+            parts.append(timestamp)
+        name = SAVE_FILE_PREFIX + "_".join(parts)
+        path = os.path.join(save_dir, name + SAVE_FILE_EXT)
         try:
             os.makedirs(save_dir, exist_ok=True)
-            with open(os.path.join(save_dir, name + SAVE_FILE_EXT),
-                      "w", encoding="utf-8") as f:
+            # 只跟最近一次存檔比較。這符合連續按紀錄時避免重覆的用途,同時允許
+            # 使用者日後刻意另存一份與較舊紀錄相同的內容。
+            if self.save_avoid_duplicate_var.get():
+                candidates = [filename for filename in os.listdir(save_dir)
+                              if filename.startswith(SAVE_FILE_PREFIXES)
+                              and filename.endswith(SAVE_FILE_EXT)]
+                latest = max(
+                    candidates,
+                    key=lambda filename: os.path.getmtime(
+                        os.path.join(save_dir, filename)),
+                    default=None)
+                if latest:
+                    latest_path = os.path.join(save_dir, latest)
+                    try:
+                        with open(latest_path, "r", encoding="utf-8") as existing_file:
+                            existing = json.load(existing_file)
+                        existing_signature = log_signature(
+                            existing.get("log_entries", []))
+                    except (OSError, ValueError, TypeError, AttributeError):
+                        existing_signature = None
+                    if existing_signature == signature:
+                        self.log_error(f"⚠️ 日誌內容與最近存檔 {latest} 相同,未重複存檔")
+                        return
+            if os.path.exists(path):
+                self.log_error(f"❌ 存檔名稱已存在,請修改日期、職業或標籤選項:{name}")
+                return
+            with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=1)
         except (OSError, TypeError, ValueError) as exc:
             self.log_error(f"❌ 存檔失敗:{exc}")
@@ -6542,7 +6693,7 @@ class LiveDamageMonitor:
         names = []
         try:
             for fn in os.listdir(get_save_dir()):
-                if fn.startswith(SAVE_FILE_PREFIX) and fn.endswith(SAVE_FILE_EXT):
+                if fn.startswith(SAVE_FILE_PREFIXES) and fn.endswith(SAVE_FILE_EXT):
                     names.append(fn[:-len(SAVE_FILE_EXT)])
         except OSError:
             pass   # 資料夾還沒建立 = 還沒存過檔,不是錯誤

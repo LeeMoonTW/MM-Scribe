@@ -47,9 +47,13 @@ sys.exit(1)
 PY
 then
     echo "BPF 可直接存取,免 sudo 啟動"
-    exec "$VENV_PY" "$SCRIPT"
+    exec "$VENV_PY" -X faulthandler "$SCRIPT"
 fi
 
 echo "需要提權才能抓封包 — 接下來會要求輸入密碼"
 echo "(想免 sudo 的話,安裝 Wireshark 內附的 ChmodBPF 即可)"
-exec sudo "${TK_ENV[@]}" "$VENV_PY" "$SCRIPT"
+# macOS Bash 3.2 treats an empty array as unset under `set -u`.
+if [[ ${#TK_ENV[@]} -gt 0 ]]; then
+    exec sudo "${TK_ENV[@]}" "$VENV_PY" -X faulthandler "$SCRIPT"
+fi
+exec sudo "$VENV_PY" -X faulthandler "$SCRIPT"

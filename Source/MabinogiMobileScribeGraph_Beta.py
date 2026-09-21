@@ -42,7 +42,8 @@ FONT_UI = "PingFang TC" if IS_MACOS else "Microsoft JhengHei"
 # 存檔格式 (與主程式同步 —— 改主程式的存檔欄位語意時這裡要跟著升版)
 # ----------------------------------------------------
 SAVE_DIR_NAME = "Save"
-SAVE_FILE_PREFIX = "MMScribe_"
+SAVE_FILE_PREFIX = "MM_"
+SAVE_FILE_PREFIXES = (SAVE_FILE_PREFIX, "MMScribe_")  # 新格式 + 舊版存檔
 SAVE_FILE_EXT = ".json"
 SAVE_FORMAT_VERSION = 1
 SAVE_COMBO_EMPTY = "(無存檔)"
@@ -350,7 +351,7 @@ def list_saves():
     names = []
     try:
         for fn in os.listdir(get_save_dir()):
-            if fn.startswith(SAVE_FILE_PREFIX) and fn.endswith(SAVE_FILE_EXT):
+            if fn.startswith(SAVE_FILE_PREFIXES) and fn.endswith(SAVE_FILE_EXT):
                 names.append(fn[:-len(SAVE_FILE_EXT)])
     except OSError:
         pass   # 資料夾不存在 = 還沒存過檔,不是錯誤
