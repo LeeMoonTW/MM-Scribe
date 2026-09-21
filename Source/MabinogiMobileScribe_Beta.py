@@ -767,6 +767,10 @@ def load_settings():
         "show_break_value": False,
         "popout_log": False,
         "popout_skill": False,
+        # 存檔選項 (見 save_snapshot):避免重複存檔 / 檔名自動帶日期、職業
+        "save_avoid_duplicate": True,
+        "save_auto_date": True,
+        "save_auto_job": True,
         # 診斷 LOG 展開視窗的分類過濾 (dev_filter_<key>);預設全開
         **{f"dev_filter_{key}": True for key, _, _ in DEV_CATEGORIES},
         # 代理模式偵測要比對的遊戲執行檔名 (見 detect_local_game_proxy)。
@@ -816,6 +820,13 @@ def load_settings():
         result["popout_skill"] = parser.getboolean("Layout", "popout_skill", fallback=False)
     except (ValueError, configparser.Error):
         pass
+    for key, ini_key in (("save_avoid_duplicate", "avoid_duplicate"),
+                         ("save_auto_date", "auto_date"),
+                         ("save_auto_job", "auto_job")):
+        try:
+            result[key] = parser.getboolean("Save", ini_key, fallback=True)
+        except (ValueError, configparser.Error):
+            pass
     for key, _, _ in DEV_CATEGORIES:
         try:
             result[f"dev_filter_{key}"] = parser.getboolean(
@@ -850,6 +861,11 @@ def save_settings(settings):
     parser["Layout"] = {
         "popout_log": "true" if settings.get("popout_log", False) else "false",
         "popout_skill": "true" if settings.get("popout_skill", False) else "false",
+    }
+    parser["Save"] = {
+        "avoid_duplicate": "true" if settings.get("save_avoid_duplicate", True) else "false",
+        "auto_date": "true" if settings.get("save_auto_date", True) else "false",
+        "auto_job": "true" if settings.get("save_auto_job", True) else "false",
     }
     parser["DevLog"] = {
         f"filter_{key}": "true" if settings.get(f"dev_filter_{key}", True) else "false"
@@ -1366,6 +1382,11 @@ class LiveDamageMonitor:
         self.track_heal_var = tk.BooleanVar(value=self.track_heal)
         self.detect_chain_var = tk.BooleanVar(value=self.detect_chain)
         self.show_break_value_var = tk.BooleanVar(value=self.show_break_value)
+        # 存檔選項 (設定畫面「存檔」區塊);標籤不在設定裡,輸入框留在紀錄列
+        self.save_avoid_duplicate_var = tk.BooleanVar(
+            value=self.settings["save_avoid_duplicate"])
+        self.save_timestamp_var = tk.BooleanVar(value=self.settings["save_auto_date"])
+        self.save_job_var = tk.BooleanVar(value=self.settings["save_auto_job"])
 
         # Popout 旗標 (獨立視窗顯示攻擊日誌 / 技能排行)
         # popout_log_win / popout_skill_win: Toplevel 或 None
@@ -1714,53 +1735,33 @@ class LiveDamageMonitor:
         self.ctrl_row4.pack(side="bottom", fill="x", padx=10, pady=(0, 3))
         ctrl_row4 = self.ctrl_row4  # local alias,與其他控制列一致
 
-        # 存檔命名列。留空的欄位不會產生多餘的底線。
-        self.save_name_row = ctk.CTkFrame(root, corner_radius=0)
-        self.save_name_row.pack(side="bottom", fill="x", padx=10, pady=(0, 3))
-        self.save_tag_var = tk.StringVar()
-        self.save_avoid_duplicate_var = tk.BooleanVar(value=True)
-        self.save_timestamp_var = tk.BooleanVar(value=True)
-        self.save_job_var = tk.BooleanVar(value=True)
-        self.save_tag_enabled_var = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
-            self.save_name_row, text="避免重覆LOG",
-            variable=self.save_avoid_duplicate_var, width=104).pack(
-                side="left", padx=(8, 2), pady=6)
-        self.save_timestamp_check = ctk.CTkCheckBox(
-            self.save_name_row, text="自動日期", variable=self.save_timestamp_var,
-            width=82)
-        self.save_timestamp_check.pack(side="left", padx=2, pady=6)
-        ctk.CTkCheckBox(
-            self.save_name_row, text="自動職業", variable=self.save_job_var,
-            width=82).pack(side="left", padx=2, pady=6)
-        ctk.CTkCheckBox(
-            self.save_name_row, text="標籤", variable=self.save_tag_enabled_var,
-            command=self._toggle_save_tag, width=58).pack(
-                side="left", padx=2, pady=6)
-        self.save_tag_entry = ctk.CTkEntry(
-            self.save_name_row, textvariable=self.save_tag_var,
-            placeholder_text="tag", width=105)
-        self.save_tag_entry.pack(
-            side="left", padx=2, pady=6)
-
+        # 兩行 grid:上行 紀錄 | 標籤 (橫跨兩欄,右緣與 🔄 對齊)
+        #           下行 讀取 | 下拉選單 | 🔄
+        # 其餘存檔選項 (避免重複 / 自動日期 / 自動職業) 在設定畫面「存檔」區塊
         self.btn_save = ctk.CTkButton(ctrl_row4, text="💾 紀錄", width=70, corner_radius=8,
                                       fg_color="#5a7a9a", hover_color="#6a8aaa",
                                       command=self.save_snapshot)
-        self.btn_save.pack(side="left", padx=(6, 2), pady=6)
+        self.btn_save.grid(row=0, column=0, padx=(6, 2), pady=(6, 2))
+        # 標籤:有字就加進檔名,留空就不加。不綁 textvariable —— CTkEntry 綁了
+        # 變數就不顯示 placeholder;get() 在顯示 placeholder 時會回空字串
+        self.save_tag_entry = ctk.CTkEntry(ctrl_row4, placeholder_text="標籤 (選填)",
+                                           corner_radius=8, font=(FONT_LOG, 11))
+        self.save_tag_entry.grid(row=0, column=1, columnspan=2, sticky="ew",
+                                 padx=(6, 2), pady=(6, 2))
         self.btn_load = ctk.CTkButton(ctrl_row4, text="📂 讀取", width=70, corner_radius=8,
                                       fg_color="#5a7a9a", hover_color="#6a8aaa",
                                       command=self.load_snapshot)
-        self.btn_load.pack(side="left", padx=2, pady=6)
+        self.btn_load.grid(row=1, column=0, padx=(6, 2), pady=(2, 6))
         self.save_file_var = tk.StringVar(value=SAVE_COMBO_EMPTY)
         self.save_combo = ctk.CTkComboBox(ctrl_row4, values=[SAVE_COMBO_EMPTY],
                                           variable=self.save_file_var, state="readonly",
                                           width=170, corner_radius=8,
                                           font=(FONT_LOG, 11))
-        self.save_combo.pack(side="left", padx=(6, 2), pady=6)
+        self.save_combo.grid(row=1, column=1, padx=(6, 2), pady=(2, 6))
         # 手動丟檔進 Save/ 的人不必重開程式才看得到
         ctk.CTkButton(ctrl_row4, text="🔄", width=32, corner_radius=8,
                       fg_color="#4a4a4a", hover_color="#6a6a6a",
-                      command=self.refresh_save_list).pack(side="left", padx=2, pady=6)
+                      command=self.refresh_save_list).grid(row=1, column=2, padx=2, pady=(2, 6))
 
         # 監聽視窗 resize,拖動期間跳過技能排行更新,結束後補刷一次
         root.bind("<Configure>", self._on_root_configure)
@@ -2283,7 +2284,6 @@ class LiveDamageMonitor:
         """
         self.root.update_idletasks()
         parts = [self.ctrl_row1, self.ctrl_row2, self.ctrl_row3, self.ctrl_row4,
-                 self.save_name_row,
                  self.status_bar]
         # 底部診斷區塊是常駐的 (發布版除外),最小高度要把它算進去
         if self.dev_strip.winfo_manager():
@@ -2332,6 +2332,13 @@ class LiveDamageMonitor:
         save_settings(self.settings)
         self.log_area._textbox.configure(tabs=self._scaled_tab_stops())
         self._render_log()
+
+    def _on_save_option_change(self):
+        """設定畫面「存檔」區塊的三個勾選,改了就寫回 settings.ini。"""
+        self.settings["save_avoid_duplicate"] = self.save_avoid_duplicate_var.get()
+        self.settings["save_auto_date"] = self.save_timestamp_var.get()
+        self.settings["save_auto_job"] = self.save_job_var.get()
+        save_settings(self.settings)
 
     def toggle_heal_collapse(self):
         """折疊/展開治癒事件日誌。折疊時 heal_log_area 隱藏但持續寫入。"""
@@ -3196,6 +3203,28 @@ class LiveDamageMonitor:
                           "　 未勾選:整筆剔除,日誌也不顯示\n"
                           "　 已勾選:日誌以黃字標註 (連攜) 並寫進存檔,但仍不計入統計\n"
                           "　 「強制偵測」下分不出誰是誰,連攜一律照常顯示並計入",
+                     font=(FONT_UI, 10),
+                     text_color="#888888", anchor="w", justify="left").pack(fill="x", pady=(8, 0))
+
+        # ── 「存檔」區塊 ──
+        save_section = ctk.CTkFrame(body, fg_color="transparent")
+        save_section.pack(fill="x", padx=12, pady=(16, 4))
+        ctk.CTkLabel(save_section, text="── 存檔 ──",
+                     font=(FONT_UI, 12),
+                     text_color="#ffffff", anchor="w").pack(fill="x", pady=(0, 8))
+        for text, var in (("避免重複存檔", self.save_avoid_duplicate_var),
+                          ("自動日期", self.save_timestamp_var),
+                          ("自動職業", self.save_job_var)):
+            ctk.CTkCheckBox(
+                save_section, text=text, variable=var,
+                command=self._on_save_option_change,
+                corner_radius=5, checkbox_width=18, checkbox_height=18,
+                font=(FONT_UI, 12),
+            ).pack(anchor="w", pady=4)
+        ctk.CTkLabel(save_section,
+                     text="※ 避免重複存檔:日誌內容與最近一份存檔相同時不再存一份\n"
+                          "※ 檔名格式:MM_日期_職業_標籤.json,未勾選或標籤留空的部分省略;\n"
+                          "　 全部省略時仍會帶上日期。標籤在主畫面「紀錄」右側輸入",
                      font=(FONT_UI, 10),
                      text_color="#888888", anchor="w", justify="left").pack(fill="x", pady=(8, 0))
 
@@ -6587,11 +6616,6 @@ class LiveDamageMonitor:
             "log_entries": entries,
         }
 
-    def _toggle_save_tag(self):
-        """標籤未勾選時停用輸入欄。"""
-        self.save_tag_entry.configure(
-            state="normal" if self.save_tag_enabled_var.get() else "disabled")
-
     def _detected_job_name(self):
         """依本場已記錄的技能判斷職業;連攜傷害屬於隊友,不拿來判斷。"""
         counts = collections.Counter()
@@ -6617,7 +6641,6 @@ class LiveDamageMonitor:
         # 用來判斷內容是否有更新。其餘日誌內容相同就視為同一份紀錄。
         ignored_save_messages = ("=== 已存檔 ", "=== 已讀取存檔 ",
                                  "=== 純檢視模式:",
-                                 "⚠️ 日誌內容沒有更新,未重複存檔",
                                  "⚠️ 日誌內容與最近存檔 ")
         def log_signature(entries):
             meaningful = [entry for entry in entries
@@ -6641,10 +6664,9 @@ class LiveDamageMonitor:
             parts.append(timestamp)
         if self.save_job_var.get():
             parts.append(clean_part(self._detected_job_name()))
-        if self.save_tag_enabled_var.get():
-            tag = clean_part(self.save_tag_var.get())
-            if tag:
-                parts.append(tag)
+        tag = clean_part(self.save_tag_entry.get())
+        if tag:
+            parts.append(tag)
         if not parts:
             parts.append(timestamp)
         name = SAVE_FILE_PREFIX + "_".join(parts)
