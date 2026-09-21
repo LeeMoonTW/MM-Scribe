@@ -291,6 +291,7 @@ DEV_CATEGORIES = (
     ("buff", "BUFF", "[BUFF]"),
     ("mob", "敵人ID", "[MOB]"),
     ("id", "角色ID", "[ID]"),
+    ("gauge", "破防槽", "[Gauge]"),
 )
 DEV_PREFIX_CAT = {prefix: key for key, _, prefix in DEV_CATEGORIES}
 IDENT_SELF_MAGIC = struct.pack("<I", IDENT_SELF_TYPE)
@@ -342,6 +343,122 @@ BUFF_OPS = {
     BUFF_UPD_TYPE: (struct.pack("<I", BUFF_UPD_TYPE), 36, "UPD"),
     BUFF_REM_TYPE: (struct.pack("<I", BUFF_REM_TYPE), 16, "REM"),
 }
+# ---- 破防槽 (暈眩值) 探針 (2026-09-20 診斷用,找到 opcode 就可以拿掉) ----
+# 傷害封包 0x5235 裡已確認沒有破防值,只有「已破防」布林。使用者回報:量條只對
+# 鎖定中的單一敵人顯示,且隊友攻擊時也會漲 —— 那是伺服器對「該敵人實體」送的
+# 狀態更新 (protocol 的 ActorStatus_SetBreakPoint / SetHealth 系列),不是傷害
+# 飄字的附帶欄位。台版 opcode 未知,所以反過來找:傷害事件已經給了敵人的
+# entityId,凡是內文裡出現這個 ID 的訊息全部撈出來,印出 opcode 與附近的位元組。
+# 破防槽會表現成「同一組 (opcode, ID 後的位移) 上逐擊遞增、暈眩後歸零」的 u32
+# 或 float32。
+# ★ 限制:只看得到 enc=0 (未壓縮) 的訊息。enc=1 的內文是 brotli,entityId 不會
+#   以明文出現 —— 若這輪完全撈不到東西,下一步就是改掃解壓後的內容。
+GAUGE_PROBE_TARGETS = 8        # 同時追蹤幾個敵人 (取最近挨打的幾隻)
+GAUGE_PROBE_TAIL = 16          # entityId 後面拉幾 bytes 來解數值
+GAUGE_PROBE_CTX = 8            # entityId 前面保留幾 bytes 的上下文
+GAUGE_PROBE_BACK = 128         # 從 entityId 往回找 9-byte 標頭的最大距離
+GAUGE_PROBE_MAX_LEN = 4096     # 合理的 contentLength 上限;超過視為撞出來的假標頭
+GAUGE_PROBE_HITS = 6           # 單一 payload 最多印幾筆
+# 未知 opcode 的 hex dump:預設關。2026-09-20 那輪已經把要找的東西挖出來了,
+# 再開著只會在 500 行額度內把破防槽/HP 的時間軸洗掉。要找新東西時再改回 True。
+GAUGE_PROBE_RAW = False
+# 就算關著 raw dump,自己剛切鎖定的這幾秒仍會盯著新目標 —— 要回答「切過去的瞬間
+# 有沒有別的 opcode 送當前值快照」,只需要這個窗口,不必整場洗版。設 0 可完全關掉。
+GAUGE_LOCK_DUMP_SEC = 0        # 2026-09-20 已用它驗完「切鎖定不補送」,關掉;要再查改成 3.0
+GAUGE_PROBE_DEDUP = 512        # 記住最近幾筆簽章,一模一樣的不重複印
+GAUGE_PROBE_BODY_HEX = 96      # body hex 最多印幾個字元
+GAUGE_LOG_MAX = 2000           # 診斷行上限,達標就停 (免得把其他 LOG 洗掉)
+# ---- 敵人狀態封包 (2026-09-20 實機錄包確認) ----
+# 都是 enc=0、固定長度、開頭 u64 entityId(高 32 位恆 0,與傷害事件同一套 ID)。
+#
+#   0x1D595 len=13 [u64 entityId][float32 值][1 byte]        ← **破防槽(暈眩值)**
+#       實測滿值 200.000(遊戲 UI 顯示 8 格 → 每格 25)。**是絕對值,不是百分比**;
+#       上限隨怪而定而且封包沒給 —— 要畫進度條只能拿 25/格 推,或用實測峰值。
+#       每招固定增量(同一招重複時完全相等),超過上限會被夾住:
+#       180.096 + 25.894 = 205.990 → 實際收到 **200.000**(這是上限的鐵證)。
+#       填滿的同一擊帶破防旗標;暈眩期間維持 200,結束後歸 0。
+#       沒破防也會自然衰退歸 0(實測 1.813 → 0)。
+#       最後那個 byte 恆為 00,破防當下也沒變 → **不是「已破防」旗標**。
+#   0x1D596 len=21 [u64 entityId][u32 blobLen=8][u64 值][1 byte]  ← **敵人 HP**
+#       實測滿血 4,815,232;脫戰後階梯式回滿。blobLen=8 不是 16 的倍數
+#       → **沒有 protocol 說的 AES 加密**,直接就是數值。
+#   0x1D797 len=16 [u64 entityId][u64 目標 entityId]          ← **鎖定目標**
+#       全 FF = 解除鎖定。
+#
+# 尚未確認:上限是不是每隻怪都 25×格數(目前只量過這一隻,200 / 8 格)。
+STATUS_BREAK_TYPE = 0x1D595
+STATUS_HEALTH_TYPE = 0x1D596
+STATUS_TARGET_TYPE = 0x1D797
+# {packetType: (magic, content 長度, 顯示名)} — 長度必須完全相符才採信 (同 BUFF_OPS)
+STATUS_OPS = {
+    STATUS_BREAK_TYPE: (struct.pack("<I", STATUS_BREAK_TYPE), 13, "破防槽"),
+    STATUS_HEALTH_TYPE: (struct.pack("<I", STATUS_HEALTH_TYPE), 21, "HP"),
+    STATUS_TARGET_TYPE: (struct.pack("<I", STATUS_TARGET_TYPE), 16, "鎖定"),
+}
+STATUS_LAST_MAX = 32           # 記住幾隻怪的前一次數值 (算 Δ 用)
+# HP 行的輸出量:"all" 全印 / "death" 只印歸零 (死亡) / "off" 完全不印。
+# 預設 "death" —— HP 每秒好幾十筆,會把破防槽的時間軸淹掉;但 HP=0 那一筆要留,
+# 它是 ▼ 那行判定「死亡重置」的依據,少了就看不懂為什麼那樣標。
+# **不論設定為何,HP 一律照常解析與快取**(死亡判定要用),這裡只管印不印。
+STATUS_HP_LOG = "death"
+GAUGE_BREAK_TAGS = frozenset(("破防", "延長破防", "終結"))
+GAUGE_HIT_NOTE_SEC = 1.0       # 同一組(目標, 是否自己打的)最多每秒記一次 (AoE 會洗版)
+# ---- 傷害 ↔ 破防增量 配對 (2026-09-20) ----
+# 目標:回答「每一筆傷害造成多少破防值」。兩個封包是分開送的,只能靠「同一個目標 +
+# 時間相近」配對。兩個方向都要做 —— 實測傷害飄字與破防槽的先後**不固定**
+# (破防那一擊是破防槽先到)。
+#   * 傷害事件先到 → 記進環形緩衝,破防槽來時往回找
+#   * 破防槽增量先到 → 掛起,等傷害事件來補對
+# ⚠ 先天限制:同一個目標在同一瞬間被多人/多段打到時,配不出唯一解。
+#   輸出會把**所有**候選列出來並標明筆數,不要看到一個就當定論。
+GAUGE_PAIR_SEC = 0.5           # 配對視窗
+GAUGE_PAIR_RING = 8            # 每個目標記幾筆待配
+GAUGE_PAIR = True              # 關掉就不做配對輸出
+# ---- 反查:傷害事件裡有沒有夾帶「這一擊的破防增量」 ----
+# 破防槽封包 (0x1D595, 13 bytes) 版面全滿,沒有攻擊者也沒有傷害值 —— 所以配對只能靠
+# 時間。但傷害事件還有沒解出來的位元組 (content 20..31 等,見 §3),當初第一輪 dump
+# 是在找「累積值」而不是「每擊增量」,兩者是不同的東西。
+# 現在 Δ 已經算得出來 → 拿它當已知答案去反查:掃整個傷害事件,找 float32 ≈ Δ 的位置。
+# 找得到就能**精確歸因**,整個先進先出的錯位風險直接消失。
+GAUGE_DELTA_HUNT = True        # 找到(或確認沒有)之後就可以關掉
+GAUGE_DELTA_EPS = 1e-4         # 相對誤差;Δ 是兩個 float32 相減來的,不會完全相等
+# 也試「整數倍縮放」的存法:0.388 可能以 388(×1000) 或 3880(×10000) 這種整數存。
+GAUGE_DELTA_SCALES = (1, 10, 100, 1000, 10000)
+GAUGE_DELTA_TALLY = 50         # 每反查這麼多次就報一次統計 —— **沒有統計就分不出
+                               # 「真的沒夾帶」與「反查根本沒跑到」**,那是相反的結論
+# 技能 → 破防增量 對照表:只收「唯一配對」的樣本(多候選的不可信)。
+# ⚠ 破防增量**不是招式固定值** —— 使用者回報會被玩家的「破防數值」屬性影響,
+#   所以這張表只在「同一角色、屬性沒變」的期間內有效。屬性一變(換裝/buff)
+#   同一招就會給出新值 —— 那正是下面這行要抓的:出現新值就印出來,不要靜靜蓋掉。
+#   同時也用來看增量是否**還受敵人影響**(行內會標是打哪一隻拿到的)。
+GAUGE_SKILL_TBL_MAX = 64       # 最多記幾招
+GAUGE_SKILL_VAL_MAX = 6        # 同一招最多記幾個不同的值 (超過就不再印,避免洗版)
+# ---- 「最大破防槽」搜捕 (2026-09-20) ----
+# 破防槽封包 (0x1D595) 只給當前值,沒有上限。上限可能在別的 opcode、或怪物登場包
+# (0x4E4C,靜態屬性最可能的落腳處) 裡。已知上限都是 25 的整數倍 (木樁 25、8 格怪
+# 200),所以反過來找:凡是帶著該敵人 entityId 的訊息,把「剛好是 25 整數倍」的
+# float32 / u32 欄位全撈出來。float32 剛好落在 25 的整數倍是罕見巧合,誤報率低。
+# 每個 (怪, 來源) 只掃一次就記住結果 —— 位置封包一秒好幾十則,不快取會拖垮攔截執行緒。
+GAUGE_MAX_UNIT = 25            # 每格的量 (由 200/8格、25/木樁 推得)
+GAUGE_MAX_GRIDS = 40           # 最多認到幾格 (25..1000)
+GAUGE_MAX_HITS = 12            # 一行最多列幾個命中欄位
+GAUGE_MAX_HUNT = False         # 已經找到 (見下),平時關掉;要找別的欄位再開
+# ★ 2026-09-20 實測命中:怪物登場包 (0x4E4C) 解壓後 **content offset 203** 的 u32
+#   就是該敵人的最大破防槽。同一份 LOG 裡 25 / 50 / 200 分別對上 1 / 2 / 8 格,
+#   「每格 25」至此跨怪確認。其餘掃到的候選 (@861/@982 的 575、@1403 的 200) 位移
+#   會隨實體浮動,是別的欄位。
+#   ⚠ 位移固定只在目前錄到的樣本成立;解不出合理值 (25 的倍數) 時會記一行警告,
+#     不要靜靜吃掉 —— 改版或別種怪的版面不同時要看得出來。
+MOB_BREAK_MAX_OFF = 203
+MOB_BREAK_MAX_TOP = GAUGE_MAX_UNIT * GAUGE_MAX_GRIDS
+# 已經解得出來的 opcode 不用再印 —— 傷害 / 技能 TLV / decoy / buff 本來就帶目標 ID
+GAUGE_PROBE_SKIP = frozenset((
+    DMG_EVENT_TYPE, SKILL_TLV_TYPE, 0x4F40,
+    BUFF_ADD_TYPE, BUFF_UPD_TYPE, BUFF_REM_TYPE,
+    MOB_APPEAR_TYPE, IDENT_APPEAR_TYPE, IDENT_SELF_TYPE,
+    # 下面這三個已經解出欄位,改由 _status_walk 印,不再 dump hex
+    STATUS_BREAK_TYPE, STATUS_HEALTH_TYPE, STATUS_TARGET_TYPE,
+))
 # 無限持續的判定:**不能比對特定值**。實測拿到 0xD1B03913 與 0xD1B03914 兩個,
 # 解成 float32 是 -94608973824.0 / -94608982016.0 —— 都是「約 -3000 年」,
 # 差一個 ULP = 8192 秒 ≈ 2.3 小時。這欄放的是絕對時間值,底層時鐘一直在走,
@@ -369,7 +486,7 @@ BUFF_ACTIVE_MAX = 512             # 同時追蹤幾筆 buff。換場景時舊實
                                   # 沒有上限就是純漏水(自己的 buff 只有個位數,
                                   # 額度幾乎都花在場上其他實體身上)
 DISCORD_INVITE_URL = "https://discord.gg/NaddqvBVvb"
-# 日誌欄位布局: \t [傷害值 (右對齊)] \t [標籤 (左對齊)] \t [技能名稱 (可往右溢出)]
+# 日誌欄位布局: \t [傷害值 (右)] \t [破防值 (右)] \t [標籤 (左)] \t [技能名稱 (可往右溢出)]
 # 行首那個 tab 是必要的 — Tk 的 right tab stop 對齊的是「tab 之後到下一個 tab」的字,
 # 第一欄要右對齊就得先有一個 tab 把它推到停靠點。
 # 傷害值放第一欄且右緣固定,結構上不可能被其他欄位推走。
@@ -378,6 +495,8 @@ DISCORD_INVITE_URL = "https://discord.gg/NaddqvBVvb"
 LOG_DMG_WIDTH = 10                      # 傷害欄右緣位置的取樣寬度 (幾個數字寬)
 LOG_DMG_SAMPLE = "9,999,999,999"        # 傷害欄取樣 (涵蓋 UInt32 上限位數)
 LOG_TAG_SAMPLE = "[爆擊+破防+多重打擊]"   # 標籤欄取樣;更長的組合會把名稱往右推,可接受
+LOG_BRK_SAMPLE = "999.9"                # 破防值欄取樣 (小數點後一位)
+LOG_BRK_NONE = "-"                      # 配不到破防值時的佔位,保持欄位對齊
 LOG_COL_GAP = 10                        # 欄間留白
 # 標籤欄起點只留 LOG_DMG_GAP 的空隙:傷害欄的右緣就在 LOG_DMG_WIDTH 個數字寬處,
 # 不必為取樣字串的完整寬度讓位。技能名欄的起點仍以取樣字串為準(位置不變),
@@ -619,6 +738,9 @@ def load_settings():
         "track_heal": False,
         # 連攜攻擊偵測 (見 DMG_CHAIN_SUFFIX):預設關閉 = 連攜傷害整筆剔除
         "detect_chain": False,
+        # 每筆傷害的破防值欄 (見 _gauge_take_delta):配對只能靠時間,會遺失/錯位,
+        # 預設關閉 —— 日誌少一欄,想看的人自己開
+        "show_break_value": False,
         "popout_log": False,
         "popout_skill": False,
         # 診斷 LOG 展開視窗的分類過濾 (dev_filter_<key>);預設全開
@@ -658,6 +780,11 @@ def load_settings():
     except (ValueError, configparser.Error):
         pass
     try:
+        result["show_break_value"] = parser.getboolean(
+            "Tracking", "show_break_value", fallback=False)
+    except (ValueError, configparser.Error):
+        pass
+    try:
         result["popout_log"] = parser.getboolean("Layout", "popout_log", fallback=False)
     except (ValueError, configparser.Error):
         pass
@@ -694,6 +821,7 @@ def save_settings(settings):
         "track_damage": "true" if settings.get("track_damage", True) else "false",
         "track_heal": "true" if settings.get("track_heal", False) else "false",
         "detect_chain": "true" if settings.get("detect_chain", False) else "false",
+        "show_break_value": "true" if settings.get("show_break_value", False) else "false",
     }
     parser["Layout"] = {
         "popout_log": "true" if settings.get("popout_log", False) else "false",
@@ -1120,6 +1248,8 @@ class LiveDamageMonitor:
         self._mob_reset()
         # Buff 狀態 (見 _buff_reset / _buff_scan)
         self._buff_reset()
+        # 破防槽探針狀態 (見 _gauge_reset / _gauge_scan)
+        self._gauge_reset()
         # 攔截執行緒世代編號:換網卡時 +1,舊執行緒下一個封包就自行退出
         self._sniff_gen = 0
 
@@ -1185,9 +1315,12 @@ class LiveDamageMonitor:
         self.track_damage = self.settings["track_damage"]
         self.track_heal = self.settings["track_heal"]
         self.detect_chain = self.settings["detect_chain"]
+        # 破防值欄:只影響顯示。資料路徑 (_gauge_*) 一律照跑,關掉也不會少收樣本
+        self.show_break_value = self.settings["show_break_value"]
         self.track_damage_var = tk.BooleanVar(value=self.track_damage)
         self.track_heal_var = tk.BooleanVar(value=self.track_heal)
         self.detect_chain_var = tk.BooleanVar(value=self.detect_chain)
+        self.show_break_value_var = tk.BooleanVar(value=self.show_break_value)
 
         # Popout 旗標 (獨立視窗顯示攻擊日誌 / 技能排行)
         # popout_log_win / popout_skill_win: Toplevel 或 None
@@ -2116,6 +2249,15 @@ class LiveDamageMonitor:
         self.settings["detect_chain"] = self.detect_chain
         save_settings(self.settings)
 
+    def _on_show_break_value_change(self):
+        """破防值欄開關。純顯示層:破防值本來就另存在 entry 裡 (不在行文字內),
+        所以改停靠點後整份重畫就能立刻套用,已經跑過的事件也跟著變。"""
+        self.show_break_value = self.show_break_value_var.get()
+        self.settings["show_break_value"] = self.show_break_value
+        save_settings(self.settings)
+        self.log_area._textbox.configure(tabs=self._scaled_tab_stops())
+        self._render_log()
+
     def toggle_heal_collapse(self):
         """折疊/展開治癒事件日誌。折疊時 heal_log_area 隱藏但持續寫入。"""
         if self.heal_collapsed:
@@ -2789,24 +2931,38 @@ class LiveDamageMonitor:
 
     # ---- 設定畫面 ----
     def _scaled_tab_stops(self):
-        """依實際字體量測算出三個欄位停靠點,再乘 font_scale 換成像素。
+        """依實際字體量測算出欄位停靠點,再乘 font_scale 換成像素。
         量測固定在基準字級做 — CTk 的字體也是乘同一個 font_scale,兩者等比。
 
         第一個停靠點帶 "right":傷害欄靠它右對齊,不靠空白補齊,
         所以 FONT_LOG 是不是等寬字都無所謂 (微軟正黑體的空白只有數字的一半寬,
         用補空白的舊做法會歪掉)。
+
+        破防值欄關閉時整欄抽掉 (只剩三個停靠點),不留空白 —— 留著會在傷害與
+        標籤之間開一個看不出用途的洞。行的內容由 _log_line_text() 同步決定。
         """
         if self._log_font is None:
             self._log_font = tkfont.Font(family=FONT_LOG, size=13)
         measure = self._log_font.measure
         # 傷害欄:右緣落在 LOG_DMG_WIDTH 個數字寬的位置
         stop0 = measure("9" * LOG_DMG_WIDTH)
-        # 標籤欄:貼著傷害欄右緣,只留 LOG_DMG_GAP
-        stop1 = stop0 + LOG_DMG_GAP
-        # 技能名欄:仍以傷害取樣字串為基準,不受上面縮排影響 (位置固定)
-        stop2 = measure(LOG_DMG_SAMPLE) + measure(LOG_TAG_SAMPLE) + LOG_COL_GAP * 2
-        px = [str(int(v * self.font_scale)) for v in (stop0, stop1, stop2)]
-        return (px[0], "right", px[1], "left", px[2], "left")
+        stops = [(stop0, "right")]
+        if self.show_break_value:
+            # 破防值欄:數字,同樣右對齊 —— 停靠點是它的**右緣**
+            stop1 = stop0 + LOG_DMG_GAP + measure(LOG_BRK_SAMPLE)
+            stops.append((stop1, "right"))
+            # 標籤欄:貼著破防值欄右緣
+            stop2 = stop1 + LOG_COL_GAP
+        else:
+            stop2 = stop0 + LOG_DMG_GAP
+        stops.append((stop2, "left"))
+        # 技能名欄:讓過標籤欄的取樣寬度 (位置固定,不隨實際標籤長度跳動)
+        stops.append((stop2 + measure(LOG_TAG_SAMPLE) + LOG_COL_GAP, "left"))
+        out = []
+        for v, align in stops:
+            out.append(str(int(v * self.font_scale)))
+            out.append(align)
+        return tuple(out)
 
     def show_settings(self):
         """建立覆蓋整個視窗的設定畫面。已顯示時不重複建立。"""
@@ -2940,6 +3096,22 @@ class LiveDamageMonitor:
             corner_radius=5, checkbox_width=18, checkbox_height=18,
             font=(FONT_UI, 12),
         ).pack(anchor="w", pady=4)
+
+        ctk.CTkCheckBox(
+            track_section,
+            text="每筆傷害破防值 (Beta)",
+            variable=self.show_break_value_var,
+            command=self._on_show_break_value_change,
+            corner_radius=5, checkbox_width=18, checkbox_height=18,
+            font=(FONT_UI, 12),
+        ).pack(anchor="w", pady=4)
+        ctk.CTkLabel(track_section,
+                     text="※ 開啟時會在傷害右側顯示破防值,目前偵測方式僅 8 成正確,\n"
+                          "　 可能會出現破防值遺失、偏移到其他傷害的情況。\n"
+                          "　 建議在單人情況下測試,多人時破防值會有爆增的問題。",
+                     font=(FONT_UI, 10),
+                     text_color="#888888", anchor="w", justify="left").pack(
+                         fill="x", padx=(26, 0), pady=(0, 2))
 
         ctk.CTkLabel(track_section,
                      text="※ 攻擊數值/治癒數值可同時勾選;至少留一個開啟以免主畫面空白\n"
@@ -3561,6 +3733,20 @@ class LiveDamageMonitor:
                 or self.selected_target == TARGET_ALL
                 or entry["target"] == self.selected_target)
 
+    def _log_line_text(self, entry):
+        """組出這筆 entry 實際要顯示的一行。
+
+        entry["text"] 存的是**不含破防值**的版本,破防值另外放在 entry["brk"] ——
+        這樣「每筆傷害破防值」開關切換時,整份重畫就能即時加欄/去欄,
+        不會留下一半三欄一半四欄的舊行 (停靠點只有一組,混欄一定會歪)。
+        """
+        brk = entry.get("brk")
+        if brk is None or not self.show_break_value:
+            return entry["text"]
+        # 版面是 "\t傷害\t標籤\t技能名":破防值插在傷害欄後面
+        dmg, sep, rest = entry["text"][1:].partition("\t")
+        return f"\t{dmg}\t{brk}{sep}{rest}"
+
     def _insert_log_line(self, entry):
         """把單筆 entry 寫進 log_area。
         紅字判定放在這裡即時算 (而非存進 entry),這樣切換高亮標籤後重畫,
@@ -3569,21 +3755,24 @@ class LiveDamageMonitor:
         highlight = self.highlight_var.get()
         red = entry["error"] or (highlight != "無" and highlight in entry["tags"])
         tag = "highlight" if red else entry.get("color")
+        text = self._log_line_text(entry)
         self.log_area.configure(state="normal")
         if tag:
-            self.log_area._textbox.insert("end", entry["text"] + "\n", tag)
+            self.log_area._textbox.insert("end", text + "\n", tag)
         else:
-            self.log_area.insert("end", entry["text"] + "\n")
+            self.log_area.insert("end", text + "\n")
         # 只捲垂直:wrap="none" 下 see() 會連帶水平捲到行尾,把傷害值欄推出視野
         self.log_area._textbox.yview_moveto(1.0)
         self.log_area.configure(state="disabled")
 
-    def _append_log(self, text, target=None, tags=(), error=False, color=None):
+    def _append_log(self, text, target=None, tags=(), error=False, color=None,
+                    brk=None):
         """新事件的快速路徑:進緩衝,看得到才畫 (不重畫整份)。
         color = 額外的文字色 tag (目前只有 ident_ok);紅字優先權高於它。
+        brk = 破防值欄的文字 (見 _log_line_text);非傷害事件一律 None。
         """
         entry = {"text": text, "target": target, "tags": tags,
-                 "error": error, "color": color}
+                 "error": error, "color": color, "brk": brk}
         self.log_entries.append(entry)
         if self._log_visible(entry):
             self._insert_log_line(entry)
@@ -3602,7 +3791,7 @@ class LiveDamageMonitor:
         for entry in self.log_entries:
             if not self._log_visible(entry):
                 continue
-            lines.append(entry["text"])
+            lines.append(self._log_line_text(entry))
             if entry["error"] or (highlight != "無" and highlight in entry["tags"]):
                 tagged_rows.append((len(lines), "highlight"))
             elif entry.get("color"):
@@ -3626,10 +3815,11 @@ class LiveDamageMonitor:
         """紅字錯誤訊息(共用 highlight tag)。"""
         self._append_log(text, error=True)
 
-    def log_damage(self, text, tags, target_id, color=None):
+    def log_damage(self, text, tags, target_id, color=None, brk=None):
         """攻擊事件:記下受擊目標,供切換目標時過濾。
-        color 目前只有 "chain" (連攜傷害,黃字);高亮標籤的紅字優先權仍在它之上。"""
-        self._append_log(text, target=target_id, tags=tags, color=color)
+        color 目前只有 "chain" (連攜傷害,黃字);高亮標籤的紅字優先權仍在它之上。
+        brk 是破防值欄的文字,要不要顯示由 _log_line_text() 依設定決定。"""
+        self._append_log(text, target=target_id, tags=tags, color=color, brk=brk)
 
 
     @staticmethod
@@ -4422,6 +4612,13 @@ class LiveDamageMonitor:
             self._mob_tally()
 
     def _mob_report(self, eid, plain):
+        # 最大破防槽:登場包固定位移 (見 MOB_BREAK_MAX_OFF);探針階段可再開廣掃
+        try:
+            self._gauge_take_max(eid, plain)
+            if self.is_dev_mode:
+                self._gauge_max_scan(plain, eid, "登場包")
+        except Exception:
+            pass
         code = self._mob_find_code(plain)
         if code is None:
             self._mob_n_nocode += 1
@@ -4566,6 +4763,549 @@ class LiveDamageMonitor:
         while len(self._buff_seen) > MOB_SEEN_MAX:
             self._buff_seen.popitem(last=False)
         return True
+
+    # ================================================
+    # 破防槽探針 — 只寫診斷 LOG,不進統計 (見 GAUGE_PROBE_* 常數)
+    # ================================================
+
+    def _gauge_reset(self):
+        self._gauge_targets = collections.OrderedDict()   # 敵人 entityId → 最後挨打時間
+        self._gauge_seen = collections.OrderedDict()      # 簽章 → True (一樣的不再印)
+        self._gauge_last = collections.OrderedDict()     # (opcode, eid) → 前一次的值
+        self._gauge_peak = collections.OrderedDict()     # eid → 本輪破防槽峰值
+        self._gauge_lock_at = collections.OrderedDict()  # (opcode, eid) → 剛被鎖定的時間
+        self._gauge_lock_watch = collections.OrderedDict()  # eid → 盯到什麼時候
+        self._gauge_my_lock = None                       # 自己當前鎖定的目標
+        self._gauge_hits = collections.OrderedDict()     # (eid, 是否自己打的) → 上次記錄時間
+        self._gauge_seen_at = collections.OrderedDict()  # (opcode, eid) → 上次變動的時間
+        self._gauge_max_seen = collections.OrderedDict() # (eid, 來源) → 已掃過
+        self._gauge_max = collections.OrderedDict()      # eid → 最大破防槽
+        self._gauge_tick = 0                             # 經手的傷害事件筆數
+        self._gauge_skip_nobrk = 0                       # DoT:確定不產生破防,不取佇列
+        self._gauge_sustain_n = 0                        # 間接傷害:照取(部分技能會產生)
+        self._gauge_q_n = 0                              # 破防增量入列次數
+        self._gauge_hunt_n = 0                           # 反查執行次數
+        self._gauge_hunt_skip = 0                        # 傷害事件沒配到 Δ 的次數
+        self._gauge_pending = collections.OrderedDict()   # eid → deque[(t, 破防增量)]
+        self._gauge_skill_tbl = collections.OrderedDict() # skill_id → {增量: 目標名}
+        self._gauge_lines = 0
+
+    def _gauge_note_target(self, eid):
+        """傷害事件的目標就是候選敵人。
+
+        不看統計門檻 (隊友打的也算) —— 使用者回報破防槽本來就會因為隊友的
+        攻擊而漲,只收自己打的反而會把最好的樣本排除掉。
+        """
+        self._gauge_targets.pop(eid, None)
+        self._gauge_targets[eid] = time.time()
+        while len(self._gauge_targets) > GAUGE_PROBE_TARGETS:
+            self._gauge_targets.popitem(last=False)
+
+    def _gauge_scan(self, payload):
+        """探針入口 — 任何例外都不得影響其他解析。"""
+        try:
+            self._status_walk(payload)      # 已解出欄位的:印數值與 Δ
+            self._gauge_walk(payload)       # 其餘的:照舊 dump hex 找新東西
+        except Exception:
+            pass
+
+    def _status_walk(self, payload):
+        """已命名的敵人狀態封包 (見 STATUS_OPS)。
+
+        守門與 _buff_walk 同一套:opcode 相符 + contentLength 完全相等 + enc==0。
+        只印「正在打的那幾隻」(_gauge_targets) —— 場上每隻怪都在送狀態更新,
+        不過濾會直接把 LOG 淹掉。
+        """
+        n = len(payload)
+        for ptype, (magic, clen, name) in STATUS_OPS.items():
+            pos = 0
+            while True:
+                off = payload.find(magic, pos)
+                if off < 0 or off + 9 + clen > n:
+                    break
+                pos = off + 1
+                if struct.unpack_from("<I", payload, off + 4)[0] != clen:
+                    continue
+                if payload[off + 8] != 0:
+                    continue
+                body = payload[off + 9:off + 9 + clen]
+                # entityId 是 u64,但高 32 位恆 0 —— 與傷害事件取低 32 位的作法一致
+                if struct.unpack_from("<I", body, 4)[0] != 0:
+                    continue
+                eid = struct.unpack_from("<I", body, 0)[0]
+                if eid not in self._gauge_targets:
+                    # 鎖定包的擁有者是「誰在鎖」(玩家/別隻怪),被鎖的才是我們在追的
+                    if ptype != STATUS_TARGET_TYPE:
+                        continue
+                    # **自己的鎖定切換一律要收**:切到一隻還沒打過的怪時,它還不在
+                    # 追蹤名單裡,在這裡擋掉就永遠加不進去 —— 切過去會什麼都收不到
+                    if (eid != self.ident_self_entity
+                            and struct.unpack_from("<I", body, 8)[0]
+                            not in self._gauge_targets):
+                        continue
+                self._status_report(ptype, name, eid, body)
+
+    def _status_report(self, ptype, name, eid, body):
+        label = self._target_label(eid)
+        if ptype == STATUS_TARGET_TYPE:
+            tgt = struct.unpack_from("<I", body, 8)[0]
+            who = "(解除)" if tgt == 0xFFFFFFFF else self._target_label(tgt)
+            self._gauge_note(f"[Gauge] 鎖定 {label} → {who}")
+            # 自己切換鎖定目標時:
+            #   (a) 把該目標的去重狀態清掉 —— 伺服器如果送的是「當前值快照」,
+            #       那個值很可能與上次看到的相同,不清掉就會被去重吃掉,
+            #       看起來像「切鎖定後收不到」,那是假的結論。
+            #   (b) 記下時間,首筆數值會標 ⏱,才分得出是快照還是下一擊的更新。
+            #   (c) 順手納入追蹤 —— 還沒打過的目標也要收得到。
+            if self.ident_self_entity is not None and eid != self.ident_self_entity:
+                return                      # 別人 (或怪) 的鎖定,只印不影響狀態
+            self._gauge_my_lock = None if tgt == 0xFFFFFFFF else tgt
+            if tgt != 0xFFFFFFFF:
+                self._gauge_note_target(tgt)
+                now = time.time()
+                if GAUGE_LOCK_DUMP_SEC > 0:
+                    self._gauge_lock_watch.pop(tgt, None)
+                    self._gauge_lock_watch[tgt] = now + GAUGE_LOCK_DUMP_SEC
+                    while len(self._gauge_lock_watch) > STATUS_LAST_MAX:
+                        self._gauge_lock_watch.popitem(last=False)
+                for op in (STATUS_BREAK_TYPE, STATUS_HEALTH_TYPE):
+                    self._gauge_last.pop((op, tgt), None)
+                    self._gauge_lock_at.pop((op, tgt), None)
+                    self._gauge_lock_at[(op, tgt)] = now
+                while len(self._gauge_lock_at) > STATUS_LAST_MAX:
+                    self._gauge_lock_at.popitem(last=False)
+            return
+        if ptype == STATUS_BREAK_TYPE:
+            val = struct.unpack_from("<f", body, 8)[0]
+            top = self._gauge_max.get(eid)
+            if top:
+                txt = f"{val:.3f}/{top} ({val / GAUGE_MAX_UNIT:.1f}/{top // GAUGE_MAX_UNIT} 格)"
+            else:
+                txt = f"{val:.3f}"
+            tail = f" 尾碼:{body[12]:02X}"     # 恆 00;真的破防時會不會變成 01 是重點
+        else:
+            if struct.unpack_from("<I", body, 8)[0] != 8:
+                return                        # blobLen 不是 8 → 版面不同,先不解讀
+            val = struct.unpack_from("<Q", body, 12)[0]
+            txt = f"{val:,}"
+            tail = f" 尾碼:{body[20]:02X}"
+        key = (ptype, eid)
+        prev = self._gauge_last.get(key)
+        if prev is not None and prev == val:
+            return                            # 值沒變的重送不印
+        self._gauge_last.pop(key, None)
+        self._gauge_last[key] = val
+        while len(self._gauge_last) > STATUS_LAST_MAX:
+            self._gauge_last.popitem(last=False)
+        if prev is None:
+            delta = ""
+        elif ptype == STATUS_BREAK_TYPE:
+            delta = f" (Δ{val - prev:+.3f})"
+        else:
+            delta = f" (Δ{val - prev:+,})"
+        if ptype == STATUS_BREAK_TYPE and prev is not None:
+            self._gauge_pair_delta(eid, val - prev)
+        if ptype == STATUS_BREAK_TYPE:
+            # 槽一往下掉就代表這一輪結束(破防歸零或自然衰退),掉之前的峰值
+            # 就是這隻怪的破防上限。實測已衝到 149.106 → **不是百分比**,
+            # 上限隨怪而定,所以只能這樣量出來。
+            peak = self._gauge_peak.get(eid)
+            if peak is None or val > peak:
+                self._gauge_peak.pop(eid, None)
+                self._gauge_peak[eid] = val
+                while len(self._gauge_peak) > STATUS_LAST_MAX:
+                    self._gauge_peak.popitem(last=False)
+            elif prev is not None and val < prev:
+                # 槽歸零有兩種完全不同的原因,一定要分開 —— 怪死掉也會歸零,
+                # 那種峰值只是「死的時候剛好累到多少」,拿來當上限會直接判錯。
+                # 靠同一隻怪最後一筆 HP 分辨(0x1D596 與 0x1D595 同場送)。
+                hp = self._gauge_last.get((STATUS_HEALTH_TYPE, eid))
+                top = self._gauge_max.get(eid)
+                if top and peak >= top - 0.01:
+                    why = f"★ 達上限 {top} → 破防"
+                elif hp == 0:
+                    why = "☠ HP=0 死亡重置,峰值不是上限"
+                elif top:
+                    # HP=0 的封包可能比破防槽晚到,所以「HP 還有」不代表沒死
+                    why = f"未達上限 {top} → 自然衰退或稍後死亡"
+                elif hp is None:
+                    why = "HP 與上限都未知"
+                else:
+                    why = f"HP 還有 {hp:,} → 破防或自然衰退"
+                self._gauge_note(f"[Gauge] ▼ {label} 破防槽下降 "
+                                 f"{prev:.3f} → {val:.3f} | 本輪峰值 {peak:.3f}"
+                                 f" | {why}")
+                self._gauge_peak[eid] = val
+        # 距上次變動多久:破防槽才需要 —— 要量「沒人打之後多久會衰退歸零」,
+        # 以及歸零這件事到底有沒有送給沒在打它的人 (做快取面板的前提)
+        gap = ""
+        if ptype == STATUS_BREAK_TYPE:
+            now = time.time()
+            was = self._gauge_seen_at.get(key)
+            if was is not None:
+                gap = f" | 距上次 {now - was:.1f}s"
+            self._gauge_seen_at.pop(key, None)
+            self._gauge_seen_at[key] = now
+            while len(self._gauge_seen_at) > STATUS_LAST_MAX:
+                self._gauge_seen_at.popitem(last=False)
+        since = self._gauge_lock_at.pop(key, None)
+        # 切鎖定後的第一筆:標上間隔。極短(<0.5s)且值不是 0 → 伺服器有送當前值快照;
+        # 要等到下一次命中才出現 → 只送增量,切過去的瞬間拿不到現況。
+        lock_mark = "" if since is None else f" | ⏱ 鎖定後 {time.time() - since:.2f}s 首筆"
+        if ptype == STATUS_HEALTH_TYPE and not (
+                STATUS_HP_LOG == "all"
+                or (STATUS_HP_LOG == "death" and val == 0)):
+            return                        # 快取已更新,只是不印 (見 STATUS_HP_LOG)
+        self._gauge_note(f"[Gauge] {name} {label} {txt}{delta}{tail}{gap}{lock_mark}")
+
+    def _gauge_walk(self, payload):
+        if self._gauge_lines > GAUGE_LOG_MAX:
+            return
+        # dump 的對象:RAW 全開時是所有追蹤中的怪,否則只有剛切鎖定的窗口內目標
+        now = time.time()
+        if GAUGE_PROBE_RAW:
+            dump = set(self._gauge_targets)
+        else:
+            dump = {e for e, until in self._gauge_lock_watch.items() if until > now}
+            for e in [e for e, until in self._gauge_lock_watch.items() if until <= now]:
+                self._gauge_lock_watch.pop(e, None)
+        # 上限搜捕對所有追蹤中的怪都做(每個 opcode 只掃一次,成本有上限)
+        watch = dump | (set(self._gauge_targets) if GAUGE_MAX_HUNT else set())
+        if not watch:
+            return
+        hits = 0
+        for eid in watch:
+            needle = struct.pack("<I", eid)
+            pos = 0
+            while hits < GAUGE_PROBE_HITS:
+                p = payload.find(needle, pos)
+                if p < 0:
+                    break
+                pos = p + 1
+                frame = self._gauge_frame(payload, p)
+                if frame is None:
+                    continue          # 回推不出標頭 = 撞到的巧合,不印
+                ptype, clen, enc, head = frame
+                if ptype in GAUGE_PROBE_SKIP:
+                    continue
+                if GAUGE_MAX_HUNT:
+                    self._gauge_max_scan(
+                        payload[head + 9:min(head + 9 + clen, len(payload))],
+                        eid, f"type=0x{ptype:X}")
+                if eid not in dump:
+                    continue
+                off = p - (head + 9)
+                # 尾巴要切在這則訊息的邊界 —— 跨過去會把下一則的標頭
+                # 當成「會變的數值」讀,那是假訊號
+                tail = bytes(payload[p + 4:min(p + 4 + GAUGE_PROBE_TAIL,
+                                               head + 9 + clen, len(payload))])
+                sig = (eid, ptype, off, tail)
+                if sig in self._gauge_seen:
+                    continue          # 值沒變就不再印;會變的那個欄位才是要找的
+                self._gauge_seen[sig] = True
+                while len(self._gauge_seen) > GAUGE_PROBE_DEDUP:
+                    self._gauge_seen.popitem(last=False)
+                hits += 1
+                self._gauge_report(eid, ptype, clen, enc, off, payload, head, p, tail)
+
+    @staticmethod
+    def _gauge_frame(payload, pos):
+        """從 entityId 出現的位置往回找合理的 9-byte 標頭。
+
+        回傳 (packetType, contentLength, encodingType, 標頭 offset);找不到回 None。
+        守門:長度合理、enc 是 0/1、這個 ID 落在它的 content 範圍內。
+        由近往遠找,先命中的那個就是最可能的 —— 狀態封包都很短。
+        ※ 這是推測,不是確認過的框架解析;印出來的 type 要當成候選而非結論。
+        """
+        for head in range(pos - 9, max(-1, pos - GAUGE_PROBE_BACK) - 1, -1):
+            if head < 0:
+                break
+            clen = struct.unpack_from("<I", payload, head + 4)[0]
+            if not 1 <= clen <= GAUGE_PROBE_MAX_LEN:
+                continue
+            if payload[head + 8] > 1:
+                continue
+            if pos + 4 > head + 9 + clen:
+                continue              # ID 越過這則訊息的尾巴 → 標頭不是這個
+            ptype = struct.unpack_from("<I", payload, head)[0]
+            if not 0 < ptype <= 0xFFFFF:
+                continue
+            return ptype, clen, payload[head + 8], head
+        return None
+
+    def _gauge_report(self, eid, ptype, clen, enc, off, payload, head, p, tail):
+        vals = []
+        for i in range(0, len(tail) - 3, 4):
+            u = struct.unpack_from("<I", tail, i)[0]
+            f = struct.unpack_from("<f", tail, i)[0]
+            # float 只在數字合理時附上 (NaN / 天文數字 = 那段不是 float)
+            vals.append(f"+{i}:{u}" + (f"/{f:.3f}" if 1e-6 < abs(f) < 1e9 else ""))
+        pre = bytes(payload[max(head + 9, p - GAUGE_PROBE_CTX):p])
+        body = bytes(payload[head + 9:min(head + 9 + clen, len(payload))])
+        self._gauge_note(
+            f"[Gauge] {self._target_label(eid)} type=0x{ptype:X} len={clen} "
+            f"enc={enc} ID@{off} | 前:{pre.hex(' ').upper()} | 後: {' '.join(vals)} | "
+            f"body:{body.hex(' ').upper()[:GAUGE_PROBE_BODY_HEX]}")
+
+    @staticmethod
+    def _gauge_max_like(raw):
+        """這 4 bytes 解成 float32 或 u32 是不是「25 的整數倍」? 是就回顯示字串。"""
+        u = struct.unpack("<I", raw)[0]
+        f = struct.unpack("<f", raw)[0]
+        out = []
+        top = GAUGE_MAX_UNIT * GAUGE_MAX_GRIDS
+        # f == f 擋掉 NaN;float32 落在 25 的整數倍上是很強的訊號
+        if f == f and 0 < f <= top and f % GAUGE_MAX_UNIT == 0:
+            out.append(f"f32={f:.0f}({int(f) // GAUGE_MAX_UNIT}格)")
+        if 0 < u <= top and u % GAUGE_MAX_UNIT == 0:
+            out.append(f"u32={u}({u // GAUGE_MAX_UNIT}格)")
+        return " ".join(out) or None
+
+    def _gauge_max_scan(self, buf, eid, where):
+        """把 buf 裡所有「25 整數倍」的 4-byte 欄位連位移印出來,找最大破防槽用。
+
+        buf 可以是未壓縮訊息的 content,也可以是登場包解壓後的明文。
+        **同一個 (怪, 來源) 只掃一次**(找不到也記住),否則重送的封包會把
+        攔截執行緒吃光。代價是「欄位稍後才被填值」的情況會漏 —— 探針階段可接受。
+        """
+        if not GAUGE_MAX_HUNT:
+            return
+        key = (eid, where)
+        if key in self._gauge_max_seen:
+            return
+        self._gauge_max_seen[key] = True
+        while len(self._gauge_max_seen) > STATUS_LAST_MAX * 4:
+            self._gauge_max_seen.popitem(last=False)
+        hits = []
+        for off in range(0, len(buf) - 3):
+            txt = self._gauge_max_like(bytes(buf[off:off + 4]))
+            if txt:
+                hits.append(f"@{off} {txt}")
+                if len(hits) >= GAUGE_MAX_HITS:
+                    break
+        if hits:
+            self._gauge_note(f"[Gauge] ⌗ {self._target_label(eid)} {where} "
+                             f"疑似上限欄位: " + " | ".join(hits))
+
+    def _gauge_delta_hunt(self, payload, offset, evt_len, delta, eid):
+        """在傷害事件的位元組裡找「這一擊的破防增量」,印出位移。
+
+        三種存法都試:float32、u32、u16(後兩者再乘 GAUGE_DELTA_SCALES 的縮放)。
+        同一個位移只印一次;沒命中不吭聲,但**會計數** —— 每 GAUGE_DELTA_TALLY 次
+        報一次統計,否則「LOG 裡沒有這行」會同時代表「沒夾帶」與「根本沒跑到」,
+        那是兩個相反的結論。
+        """
+        if not GAUGE_DELTA_HUNT or delta <= 0:
+            return
+        end = min(offset + evt_len, len(payload))
+        tol = GAUGE_DELTA_EPS * max(1.0, delta)
+        # 縮放後小於兩位數的候選一律不採:Δ=0.388 在 ×1 下會四捨五入成 0/1,
+        # 而封包裡到處都是 1 —— 那是雜訊不是線索
+        scaled = [(k, round(delta * k)) for k in GAUGE_DELTA_SCALES
+                  if round(delta * k) >= 10]
+        for off in range(offset, end - 1):
+            hit = None
+            if off + 4 <= end:
+                f = struct.unpack_from("<f", payload, off)[0]
+                if f == f and abs(f - delta) <= tol:
+                    hit = f"f32={f:.4f}"
+                else:
+                    u = struct.unpack_from("<I", payload, off)[0]
+                    for k, want in scaled:
+                        if u == want:
+                            hit = f"u32={u} (Δ×{k})"
+                            break
+            if hit is None:
+                u16 = struct.unpack_from("<H", payload, off)[0]
+                for k, want in scaled:
+                    if u16 == want:
+                        hit = f"u16={u16} (Δ×{k})"
+                        break
+            if hit is None:
+                continue
+            rel = off - offset
+            key = ("delta", rel, hit.split("=")[0])
+            if key in self._gauge_max_seen:
+                continue
+            self._gauge_max_seen[key] = True
+            self._gauge_note(f"[Gauge] ⌗ 傷害事件 @{rel} 疑似夾帶破防增量 {hit} "
+                             f"(Δ{delta:+.3f}) 對 {self._target_label(eid)}")
+
+    def _gauge_skill_seen(self, skill_id, delta, eid):
+        """登記「這招在這隻怪身上加了多少破防」,只在**出現新值**時印一行。
+
+        值會變的原因有兩種,都要看得見:
+          * 玩家的破防屬性變了 (換裝 / buff) → 同一招對同一種怪給出不同值
+          * 增量還受敵人影響 → 同一招對不同怪給出不同值 (行內標了目標,分得出來)
+        """
+        key = round(delta, 3)
+        tbl = self._gauge_skill_tbl.get(skill_id)
+        if tbl is None:
+            if len(self._gauge_skill_tbl) >= GAUGE_SKILL_TBL_MAX:
+                self._gauge_skill_tbl.popitem(last=False)
+            tbl = self._gauge_skill_tbl[skill_id] = {}
+        if key in tbl or len(tbl) > GAUGE_SKILL_VAL_MAX:
+            return
+        old = " ".join(f"{v:+.3f}({t})" for v, t in tbl.items())
+        tbl[key] = self._target_label(eid)
+        self._gauge_note(
+            f"[Gauge] ⊞ [{format_skill_name(skill_id)}] 破防 {delta:+.3f} "
+            f"對 {self._target_label(eid)}"
+            + (f" | 此招先前記到: {old}" if old else " | 首見"))
+
+    def _gauge_ring(self, store, eid):
+        """取出(必要時建立)某個目標的環形緩衝,並維持整體筆數上限。"""
+        ring = store.get(eid)
+        if ring is None:
+            ring = store[eid] = collections.deque(maxlen=GAUGE_PAIR_RING)
+            while len(store) > STATUS_LAST_MAX:
+                store.popitem(last=False)
+        return ring
+
+    def _gauge_pair_delta(self, eid, delta):
+        """破防槽增量進來 → 掛進該目標的待配佇列,等傷害事件來取。
+
+        **順序是可靠的**:封包入口先跑 _gauge_scan 再跑 _dmg_feed,而傷害事件
+        還要為了配技能 ID 多等一個視窗 (DMG_PAIR_FLUSH_SEC),所以同一擊的破防槽
+        幾乎一定比傷害事件早到。反向 (傷害先到) 只會發生在跨封包的邊界上,
+        那種就讓它過期作廢,不硬配 —— 配錯比沒有更糟。
+
+        **不受開發者模式、也不受「每筆傷害破防值」開關影響**:設定只管顯示,
+        資料路徑一律照跑 —— 中途打開就能看到後續事件,不必重開程式。
+        """
+        if not GAUGE_PAIR or delta <= 0:
+            return
+        self._gauge_q_n += 1
+        self._gauge_ring(self._gauge_pending, eid).append((time.monotonic(), delta))
+
+    def _gauge_take_delta(self, eid, dmg, mine, skill_id,
+                          payload=None, offset=0, evt_len=0):
+        """傷害事件取用一筆待配的破防增量 (先進先出);沒有就回 None。
+
+        ⚠ 這是**盡力而為的歸因**,不是精確配對:同一隻怪在視窗內被多段技能或
+        被隊友同時打到時,佇列裡誰對應誰無從分辨。佇列裡不只一筆時會在診斷行
+        標明,日誌欄位則照樣顯示 —— 使用者要的是「這一擊推了多少」的量級。
+        """
+        if not GAUGE_PAIR:
+            return None
+        # **統計一定要放在這裡** —— 每筆傷害都會經過。放進 _gauge_delta_hunt 裡面
+        # 的話,反查沒跑就不會印,結果等於沒有儀表 (這個錯犯過兩次了)。
+        # 三個數字分開看才定位得到:
+        #   入列 0        → 破防槽封包沒被解析 (目標沒進追蹤名單?)
+        #   入列多但落空多 → 順序或過期問題,不是沒資料
+        self._gauge_tick += 1
+        if self.is_dev_mode and self._gauge_tick % GAUGE_DELTA_TALLY == 0:
+            self._gauge_note(
+                f"[Gauge] ⌗ 配對統計:傷害 {self._gauge_tick} 筆 | "
+                f"破防增量入列 {self._gauge_q_n} 筆 | "
+                f"配到 {self._gauge_hunt_n} / 落空 {self._gauge_hunt_skip} | "
+                f"DoT免取 {self._gauge_skip_nobrk} | "
+                f"間接 {self._gauge_sustain_n} | "
+                f"追蹤中目標 {len(self._gauge_targets)}")
+        pend = self._gauge_pending.get(eid)
+        if not pend:
+            self._gauge_hunt_skip += 1
+            return None
+        now = time.monotonic()
+        while pend and now - pend[0][0] > GAUGE_PAIR_SEC:
+            pend.popleft()          # 過期的丟掉,不要硬配到後面不相干的傷害
+        if not pend:
+            self._gauge_hunt_skip += 1
+            return None
+        when, delta = pend.popleft()
+        self._gauge_hunt_n += 1
+        if self.is_dev_mode and payload is not None:
+            self._gauge_delta_hunt(payload, offset, evt_len, delta, eid)
+        if self.is_dev_mode:
+            warn = f" | ⚠ 佇列還有 {len(pend)} 筆,可能錯位" if pend else ""
+            self._gauge_note(
+                f"[Gauge] ⇄ {self._target_label(eid)} 破防 Δ{delta:+.3f} ← "
+                f"傷害 {dmg:,} [{format_skill_name(skill_id)}]"
+                f"{'' if mine else ' (別人打的)'} | 早到 {now - when:.2f}s{warn}")
+            if mine and not pend:
+                self._gauge_skill_seen(skill_id, delta, eid)   # 只收沒有歧義的樣本
+        return delta
+
+    def _gauge_take_max(self, eid, plain):
+        """從登場包明文取出最大破防槽並快取 (見 MOB_BREAK_MAX_OFF)。
+
+        守門:必須是 25 的正整數倍且不超過上限。不合格就記一行警告 ——
+        位移在改版或別種怪身上會變,靜靜吃掉的話面板會顯示錯誤的格數。
+        """
+        if eid in self._gauge_max:
+            return
+        off = MOB_BREAK_MAX_OFF
+        if off + 4 > len(plain):
+            return
+        val = struct.unpack_from("<I", plain, off)[0]
+        if not (0 < val <= MOB_BREAK_MAX_TOP and val % GAUGE_MAX_UNIT == 0):
+            if self.is_dev_mode and eid not in self._gauge_max_seen:
+                self._gauge_max_seen[eid] = True
+                self._gauge_note(f"[Gauge] ⚠ {self._target_label(eid)} 登場包 @{off} "
+                                 f"取到 {val},不是 {GAUGE_MAX_UNIT} 的倍數 → 版面可能變了")
+            return
+        self._gauge_max.pop(eid, None)
+        self._gauge_max[eid] = val
+        while len(self._gauge_max) > STATUS_LAST_MAX * 4:
+            self._gauge_max.popitem(last=False)
+        if self.is_dev_mode:
+            self._gauge_note(f"[Gauge] ⌗ {self._target_label(eid)} 最大破防槽 {val} "
+                             f"({val // GAUGE_MAX_UNIT} 格)")
+
+    def _gauge_hit_note(self, eid, dmg, attacker):
+        """記下「誰打到了誰、我當時鎖定誰」,用來和破防槽行配對。
+
+        沒有這行就分不出「伺服器不送」與「根本沒打到」—— 兩個待答問題都靠它:
+          * 範圍攻擊掃到沒鎖定的怪,會不會送牠的破防槽?
+          * 自己完全不出手、純看隊友打,會不會送?
+        自己打當前鎖定目標是最常見的情形,沒有診斷價值,跳過不記。
+        AoE 一秒好幾十下,同一組 (目標, 是否自己打的) 節流成每秒一行。
+        ⚠ 角色 ID 還沒綁定時 ident_self_entity 是 None,一律會被記成「別人打的」。
+        """
+        mine = (self.ident_self_entity is not None
+                and attacker == self.ident_self_entity)
+        if mine and eid == self._gauge_my_lock:
+            return
+        key = (eid, mine)
+        now = time.time()
+        if now - self._gauge_hits.get(key, 0.0) < GAUGE_HIT_NOTE_SEC:
+            return
+        self._gauge_hits.pop(key, None)
+        self._gauge_hits[key] = now
+        while len(self._gauge_hits) > STATUS_LAST_MAX:
+            self._gauge_hits.popitem(last=False)
+        who = "我" if mine else self._target_label(attacker)
+        lock_txt = ("無" if self._gauge_my_lock is None
+                    else self._target_label(self._gauge_my_lock))
+        self._gauge_note(f"[Gauge] ⚔ {self._target_label(eid)} 挨打 傷害:{dmg:,}"
+                         f" | 攻擊者:{who} | 我鎖定中:{lock_txt}")
+
+    def _gauge_state(self, eid):
+        """破防旗標亮起當下的槽況,給旗標行附註用。
+
+        **「沒收到封包」一定要講出來**:沒有破防槽 UI 的怪會不會照樣送 0x1D595,
+        只能靠這行分辨 —— 光看 LOG 裡沒有那幾行,分不出是伺服器沒送、被守門擋掉,
+        還是那隻怪根本不在追蹤名單裡。
+        另外怪如果破防後直接被打死,槽不會下降,`▼ 峰值` 那行就不會出現;
+        上限改由這裡補記,才不會白打一場。
+        """
+        cur = self._gauge_last.get((STATUS_BREAK_TYPE, eid))
+        if cur is None:
+            return "⚠ 本場沒收到任何破防槽封包 (0x1D595)"
+        peak = self._gauge_peak.get(eid, cur)
+        return f"當下破防槽 {cur:.3f} | 本輪峰值 {peak:.3f}"
+
+    def _gauge_note(self, msg):
+        # 資料路徑(破防值欄)在發布版也要跑,但診斷行只給開發者模式 ——
+        # 不擋的話發布版會一直往診斷緩衝堆字串,沒人看得到卻照樣佔記憶體
+        if not self.is_dev_mode:
+            return
+        self._gauge_lines += 1
+        if self._gauge_lines <= GAUGE_LOG_MAX:
+            self.root.after(0, lambda m=msg: self.dev_log(m))
+        elif self._gauge_lines == GAUGE_LOG_MAX + 1:
+            self.root.after(0, lambda: self.dev_log(
+                f"[Gauge] 已達 {GAUGE_LOG_MAX} 行上限,停止輸出"))
 
     def _buff_scan(self, payload):
         """探針入口 — 任何例外都不得影響其他解析。"""
@@ -4791,6 +5531,8 @@ class LiveDamageMonitor:
                         is_self_hit = self.force_all or (
                             self.ident_self_entity is not None
                             and attacker_id == self.ident_self_entity)
+                        # 破防槽追蹤的對象:挨打的一方就是目標,不問是誰打的
+                        self._gauge_note_target(target_id)
 
                         # 1. 過濾傷害免疫 (仍歸屬到該目標,切換目標時一起被過濾)
                         if dmg_val == 0xFFFFFFFF:
@@ -4944,6 +5686,40 @@ class LiveDamageMonitor:
 
                         tag_str = f"[{'+'.join(tags)}]" if tags else "[普通]"
 
+                        # 破防槽探針:把破防旗標插進 [Gauge] 時間軸,才對得出
+                        # 「槽衝到多少 → 亮旗標 → 歸零」的先後 (見 _status_report)
+                        # 破防值:取一筆待配的增量給日誌欄位用 (見 _gauge_take_delta)
+                        # **DoT 不產生破防值**(使用者實測回報) → 不能讓它去取佇列,
+                        # 否則會搶走屬於下一次真實命中的 Δ,整條時間軸往後錯一格。
+                        # ⚠ **間接傷害不能一起排除** —— 使用者更正:部分技能的間接
+                        #   傷害會產生破防值。排除它們的錯法一樣糟:該取的沒取,
+                        #   Δ 留在佇列裡照樣被下一擊拿走。沒有旗標能分辨哪些會、
+                        #   哪些不會,所以一律照取,錯配的風險攤在那些不產生的身上。
+                        #   「某些技能的連段不產生破防」同理,目前無解。
+                        if is_dot:
+                            self._gauge_tick += 1
+                            self._gauge_skip_nobrk += 1
+                            brk_delta = None
+                        else:
+                            if is_sustain:
+                                self._gauge_sustain_n += 1
+                            brk_delta = self._gauge_take_delta(
+                                target_id, dmg_val,
+                                attacker_id == self.ident_self_entity, skill_id,
+                                payload, offset,
+                                # 事件實際長度是 9 + size (外層迴圈的 +8 是保守
+                                # 步長,不是長度) —— 用 +8 會少掃最後 1 byte
+                                (size + 9) if size > 0 else DMG_EVENT_SIZE + 9)
+                        if self.is_dev_mode and target_id in self._gauge_targets:
+                            self._gauge_hit_note(target_id, dmg_val, attacker_id)
+                            hit = [t for t in tags if t in GAUGE_BREAK_TAGS]
+                            if hit:
+                                self._gauge_note(
+                                    f"[Gauge] ★ {'+'.join(hit)}旗標 "
+                                    f"{self._target_label(target_id)} "
+                                    f"傷害:{dmg_val:,} | "
+                                    f"{self._gauge_state(target_id)}")
+
                         # 4. 傷害累加:同一筆同時進 TARGET_ALL 與該攻擊對象兩個桶。
                         #    連攜 (chain_cut) 只走下面的時間序列,不碰統計桶。
                         #    目標仍然要註冊 —— 你確實打到它了,不註冊的話存檔裡的
@@ -5026,10 +5802,16 @@ class LiveDamageMonitor:
                         # tab 分隔欄位,tab stop 已在初始化時設定於固定像素位置。
                         # 行首多一個 tab:傷害值靠第一個 (right) 停靠點右對齊,
                         # 不再補空白 — 補空白只在等寬字體下才對得齊。
+                        # 破防值:配不到就放 LOG_BRK_NONE,欄位寬度不變才對得齊。
+                        # 不併進 msg —— 分開存才能在開關切換時整份重畫加欄/去欄
+                        # (見 _log_line_text)
+                        brk_txt = (LOG_BRK_NONE if brk_delta is None
+                                   else f"{brk_delta:.1f}")
                         msg = f"\t{dmg_val:,}\t{tag_str}\t{skill_display}"
                         self.root.after(0, lambda m=msg, t=list(tags), tid=target_id,
+                                        b=brk_txt,
                                         c="chain" if is_chain else None:
-                                        self.log_damage(m, t, tid, color=c))
+                                        self.log_damage(m, t, tid, color=c, brk=b))
 
                     # 事件實際總長為 9 + size,但這裡維持 +8:主迴圈是逐 byte 掃 magic,
                     # 落在前 1 byte 會自動被下一輪修正;落在後 1 byte 則會整個跳過下一筆。
@@ -5309,6 +6091,10 @@ class LiveDamageMonitor:
         # 30 秒 buff,按下去就顯示 20 秒。
         # 診斷 LOG 那一份輸出才看開發者模式,見 _buff_note
         self._buff_scan(raw_payload)
+        # 破防槽:攻擊事件日誌的破防值欄要用,所以發布版也要掃。
+        # 成本與 _buff_scan 同級 (三個 opcode 各掃一次 magic);診斷輸出另外在
+        # _gauge_note 擋掉。
+        self._gauge_scan(raw_payload)
         if not self.is_monitoring:
             return
         if self.track_damage:
@@ -5671,7 +6457,9 @@ class LiveDamageMonitor:
                  "target": None if e["target"] is None else f"0x{e['target']:08X}",
                  "tags": list(e["tags"]),
                  "error": bool(e["error"]),
-                 "color": e.get("color")}
+                 "color": e.get("color"),
+                 # 破防值與行文字分開存 (見 _log_line_text);舊存檔沒這欄 → None
+                 "brk": e.get("brk")}
                 for e in self.log_entries],
         }
 
@@ -5705,11 +6493,13 @@ class LiveDamageMonitor:
         entries = []
         for e in (raw.get("log_entries") or []):
             tgt = e.get("target")
+            brk = e.get("brk")
             entries.append({"text": str(e.get("text", "")),
                             "target": None if tgt is None else int(tgt, 16),
                             "tags": tuple(e.get("tags") or ()),
                             "error": bool(e.get("error")),
-                            "color": e.get("color")})
+                            "color": e.get("color"),
+                            "brk": None if brk is None else str(brk)})
         return {
             "saved_at": raw.get("saved_at") or "?",
             "target_stats": stats,
