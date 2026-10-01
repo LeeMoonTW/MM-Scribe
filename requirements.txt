@@ -1,0 +1,5 @@
+# Runtime dependencies; versions match the release build environment.
+# tkinter comes with Python and is not installed through pip.
+customtkinter==5.2.2
+scapy==2.7.0
+Brotli==1.1.0

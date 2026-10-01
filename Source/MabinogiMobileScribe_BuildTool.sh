@@ -43,7 +43,7 @@ PY="../.venv/bin/python"
 echo "Using Python   : $PY"
 
 if ! "$PY" -c "import PyInstaller" 2>/dev/null; then
-    echo "[ERROR] PyInstaller 未安裝:uv pip install --python $PY pyinstaller==6.21.0" >&2
+    echo "[ERROR] PyInstaller 未安裝:uv pip install --python \"$PY\" -r ../requirements-dev.txt" >&2
     exit 1
 fi
 

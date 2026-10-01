@@ -42,6 +42,15 @@ if not exist "MM_Scribe_Release.spec" (
 echo Detected graph : %GRAPH%
 echo.
 
+REM ---- Check build dependencies before cleaning existing artifacts ----
+python -c "import PyInstaller" >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] PyInstaller is unavailable. Install the build dependencies:
+    echo         python -m pip install -r "..\requirements-dev.txt"
+    pause
+    exit /b 1
+)
+
 REM ---- Auto-detect icon files. Use set "VAR=..." form to avoid trailing spaces ----
 REM     ICON_*     : sets the EXE file icon (--icon)
 REM     ADD_ICON_* : bundles the .ico into the EXE so runtime iconbitmap() can load it

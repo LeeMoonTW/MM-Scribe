@@ -56,6 +56,21 @@
 封包直接走實體網卡，不需要模擬器、網路共享或任何轉送設定。
 封包格式與 Windows 端相同，解析邏輯共用。
 
+### 安裝原始碼相依套件
+
+在專案根目錄執行（建議先建立並啟用虛擬環境）：
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+`tkinter` 由 Python 安裝提供，不透過 pip 安裝。開發與打包所需的套件列在
+`requirements-dev.txt`，包含上述執行相依套件與 PyInstaller：
+
+```bash
+python -m pip install -r requirements-dev.txt
+```
+
 ---
 
 ## Windows 使用說明
@@ -158,7 +173,7 @@ sudo "/Applications/MM Scribe.app/Contents/MacOS/MM Scribe"
 
 ```bash
 uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python scapy==2.7.0 customtkinter==5.2.2 Brotli==1.1.0
+uv pip install --python .venv/bin/python -r requirements.txt
 ./run-macos.sh
 ```
 
@@ -206,6 +221,13 @@ popout_skill = false           ; 技能傷害排行獨立視窗
 ---
 
 ## 打包方式
+
+先在專案根目錄安裝建置相依套件，再進入 `Source` 執行以下建置腳本或指令：
+
+```bash
+python -m pip install -r requirements-dev.txt
+cd Source
+```
 
 ### Windows
 

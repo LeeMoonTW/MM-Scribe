@@ -30,7 +30,7 @@ jobs:
       # Brotli 是角色身分偵測的硬相依 — 少了它解不開 0x4FFF / 0x4E4F,
       # 綁不到自己的實體 ID,傷害統計會整個空白 (見 PacketNotes_Identity §9)。
       - name: 安裝相依套件
-        run: python -m pip install scapy==2.7.0 customtkinter==5.2.2 Brotli==1.1.0 pyinstaller==6.21.0
+        run: python -m pip install -r requirements-dev.txt
 
       - name: 建置 .app
         working-directory: Source
@@ -132,7 +132,7 @@ jobs:
       # 綁不到自己的實體 ID,傷害統計會整個空白 (見 PacketNotes_Identity §9)。
       # 依賴版本與 macOS job 釘死成同一組。
       - name: 安裝相依套件
-        run: python -m pip install scapy==2.7.0 customtkinter==5.2.2 Brotli==1.1.0 pyinstaller==6.21.0
+        run: python -m pip install -r requirements-dev.txt
 
       # BuildTool.bat 會先後建出 Dev 與 Release 兩顆 exe,結尾有 pause;
       # < NUL 讓 pause 直接收 EOF,CI 才不會卡住等按鍵。
