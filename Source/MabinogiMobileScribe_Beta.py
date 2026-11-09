@@ -178,13 +178,15 @@ JOB_ABBREVIATIONS = {
 HEAL_SHIELD_SKILL_NEAR_WINDOW = 300  # Near 掃描單向視窗大小 (bytes)
 ALT_SKILL_MAX_GAP = 8                # 0x1ADE8 允許緊接 0x4EED 結束後的最大 gap
 ALT_SKILL_BACKSCAN = 64              # 往前找 0x4EED 的搜尋深度
+# 2026-11-09 再度全面改號,實錄 126 秒、21329 則訊息鏈式解析覆蓋率 100%,佈局未變;
+# 對照表見 Note/MM_Scribe_PacketNotes_Damage.md 頂端。下方註解裡的舊值保留作歷史紀錄。
 # 傷害事件 opcode — 2026-09-09 改版後伺服器重發 packet_type_config,整份目錄改號。
 # 標頭結構與欄位佈局完全沒變,只有 packetType 數值變了 (筆記 §2 第 3 點預測的情形)。
 # 驗證:1.37MB / 33223 則訊息以 9-byte 標頭鏈式解析覆蓋率 100%;0x5235 的
 #      attacker/target/dmg/flags offset 全部命中,技能 ID 解出「普攻」「魔力連結飛彈」。
-DMG_EVENT_TYPE = 0x5235           # CHANNEL_ShowDamageFloater_NTF (舊 0x51E9)
+DMG_EVENT_TYPE = 0x52CC           # CHANNEL_ShowDamageFloater_NTF (舊 0x5235)
 DMG_EVENT_MAGIC = struct.pack("<I", DMG_EVENT_TYPE)
-SKILL_TLV_TYPE = 0x4FEC           # 技能 TLV,經典型 size 35 (舊 0x4FC5)
+SKILL_TLV_TYPE = 0x502E           # 技能 TLV,經典型 size 35 (舊 0x4FEC)
 SKILL_TLV_MAGIC = struct.pack("<I", SKILL_TLV_TYPE)
 # 0x4F40 與傷害事件同為 contentLength 53,但 attacker == target 且 dmg = 0 —— 就是
 # 筆記 §3 說的 decoy。opcode 不同所以正常掃描撞不到,parse_payload 仍照 protocol 的
@@ -269,8 +271,8 @@ DMG_FLAG_CANDIDATES = (
 # **本工具不做 TCP 重組**,而 A 訊息壓縮後可達 170KB+、會跨上百個封包。
 # 這裡的做法是「串流解壓器邊收邊餵,只要吐得出前 8 bytes 就收工」——
 # 能不能成立取決於 brotli 在只收到開頭幾 KB 時肯不肯吐 output,**待實測**。
-IDENT_SELF_TYPE = 0x5028          # 2026-09-09 改版:舊 0x4FFF (解壓後佈局不變)
-IDENT_APPEAR_TYPE = 0x4E4F        # 改版後未變動 (實測仍是這個值)
+IDENT_SELF_TYPE = 0x506E          # 2026-11-09 改版:舊 0x5028 (解壓後佈局不變)
+IDENT_APPEAR_TYPE = 0x4E56        # 2026-11-09 改版:舊 0x4E4F (解壓後佈局不變)
 IDENT_SELF_MIN_SIZE = 1024        # A 訊息很大;太小的多半是對錯位撞出來的假標頭
 IDENT_SELF_FEED_MAX = 1 << 18     # 餵超過這麼多 bytes 還吐不出 8 bytes 就放棄本則
 IDENT_APPEAR_MIN_SIZE = 64        # B 訊息實測 1100~1300 bytes;放寬下限只擋明顯假的
@@ -328,7 +330,7 @@ IDENT_APPEAR_MAGIC = struct.pack("<I", IDENT_APPEAR_TYPE)
 # 這裡是純觀測:串流狀態獨立一份 (**絕不共用 _ident_streams** — 那是每條連線
 # 只追一則訊息,混進來會打斷角色 ID 綁定),只寫診斷 LOG,不碰任何統計。
 # opcode 20044 是「今天台版的值」,會隨版本變 (現有的 0x4FFF/0x4E4F 同樣風險)。
-MOB_APPEAR_TYPE = 0x4E4C          # CHANNEL_AppearingAutomaton_NTF (台版 opcode 20044)
+MOB_APPEAR_TYPE = 0x4E53          # CHANNEL_AppearingAutomaton_NTF (2026-11-09 改版:舊 0x4E4C)
 MOB_APPEAR_MAGIC = struct.pack("<I", MOB_APPEAR_TYPE)
 MOB_MIN_SIZE = 32                 # 太小的多半是對錯位撞出來的假標頭
 MOB_MAX_SIZE = 1 << 18
@@ -355,9 +357,9 @@ MOB_CODE_IGNORE = {"00000000", "01000000", "FFFFFFFF"}
 # body —— 整則訊息只有 25/45 bytes,直接逐 payload 掃 magic 就好,不必像 _mob_walk
 # 那樣維護串流狀態。假標頭靠「opcode + 長度完全相符 + enc==0」三重守門擋掉。
 # opcode 是「今天台版的值」,會隨改版變動 (與 0x5235 / 0x4E4C 同樣風險)。
-BUFF_ADD_TYPE = 0x1D4FD           # REPLICATION_ActorBuff_Add_REPL
-BUFF_UPD_TYPE = 0x1D4FF           # 更新 (同 key/buffId/秒數,只有 c 欄變)
-BUFF_REM_TYPE = 0x1D4FE           # 移除 / 到期
+BUFF_ADD_TYPE = 0x29855           # REPLICATION_ActorBuff_Add_REPL (舊 0x1D4FD)
+BUFF_UPD_TYPE = 0x29857           # 更新 (同 key/buffId/秒數,只有 c 欄變) (舊 0x1D4FF)
+BUFF_REM_TYPE = 0x29856           # 移除 / 到期 (舊 0x1D4FE)
 # {packetType: (magic, content 長度, 顯示名)} — 長度必須完全相符才採信
 BUFF_OPS = {
     BUFF_ADD_TYPE: (struct.pack("<I", BUFF_ADD_TYPE), 36, "ADD"),
@@ -407,9 +409,9 @@ GAUGE_LOG_MAX = 2000           # 診斷行上限,達標就停 (免得把其他 L
 #       全 FF = 解除鎖定。
 #
 # 尚未確認:上限是不是每隻怪都 25×格數(目前只量過這一隻,200 / 8 格)。
-STATUS_BREAK_TYPE = 0x1D595
-STATUS_HEALTH_TYPE = 0x1D596
-STATUS_TARGET_TYPE = 0x1D797
+STATUS_BREAK_TYPE = 0x298DC       # 舊 0x1D595
+STATUS_HEALTH_TYPE = 0x298DD      # 舊 0x1D596
+STATUS_TARGET_TYPE = 0x29AF3      # 舊 0x1D797
 # {packetType: (magic, content 長度, 顯示名)} — 長度必須完全相符才採信 (同 BUFF_OPS)
 STATUS_OPS = {
     STATUS_BREAK_TYPE: (struct.pack("<I", STATUS_BREAK_TYPE), 13, "破防槽"),
@@ -474,7 +476,7 @@ MOB_BREAK_MAX_OFF = 203
 MOB_BREAK_MAX_TOP = GAUGE_MAX_UNIT * GAUGE_MAX_GRIDS
 # 已經解得出來的 opcode 不用再印 —— 傷害 / 技能 TLV / decoy / buff 本來就帶目標 ID
 GAUGE_PROBE_SKIP = frozenset((
-    DMG_EVENT_TYPE, SKILL_TLV_TYPE, 0x4F40,
+    DMG_EVENT_TYPE, SKILL_TLV_TYPE, 0x4F64,  # decoy (舊 0x4F40;2026-11-09 起長度 52)
     BUFF_ADD_TYPE, BUFF_UPD_TYPE, BUFF_REM_TYPE,
     MOB_APPEAR_TYPE, IDENT_APPEAR_TYPE, IDENT_SELF_TYPE,
     # 下面這三個已經解出欄位,改由 _status_walk 印,不再 dump hex
@@ -912,7 +914,10 @@ def format_skill_name(skill_id):
     - 0x00000000  → 「疑似符文傷害」(依 PacketNotes §5,符文附加傷害的 skill ID 為 0)
     - SKILL_NAMES 有對應 → 使用者命名
     - 其他        → 顯示 hex ID
+    - None (配對不到技能) → 問號,與傷害日誌的技能欄一致
     """
+    if skill_id is None:
+        return "?" * 10
     if skill_id == 0:
         return "疑似符文傷害"
     return SKILL_NAMES.get(skill_id) or f"0x{skill_id:08X}"
@@ -5326,7 +5331,7 @@ class LiveDamageMonitor:
                 f"[Gauge] ⇄ {self._target_label(eid)} 破防 Δ{delta:+.3f} ← "
                 f"傷害 {dmg:,} [{format_skill_name(skill_id)}]"
                 f"{'' if mine else ' (別人打的)'} | 早到 {now - when:.2f}s{warn}")
-            if mine and not pend:
+            if mine and not pend and skill_id is not None:
                 self._gauge_skill_seen(skill_id, delta, eid)   # 只收沒有歧義的樣本
         return delta
 
